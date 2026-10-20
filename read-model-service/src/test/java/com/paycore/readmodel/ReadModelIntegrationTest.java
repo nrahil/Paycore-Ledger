@@ -6,6 +6,7 @@ import com.google.protobuf.Timestamp;
 import com.paycore.common.events.v1.PaymentAuthorized;
 import com.paycore.common.events.v1.PaymentCaptured;
 import com.paycore.common.events.v1.PaymentEvent;
+import com.paycore.common.events.v1.PayoutCreated;
 import com.paycore.common.events.v1.RefundProcessed;
 import com.paycore.common.ids.UuidV7;
 import com.paycore.readmodel.ReadModelProjectorService.CursorPage;
@@ -13,6 +14,9 @@ import com.paycore.readmodel.ReadModelProjectorService.MerchantSummaryResponse;
 import com.paycore.readmodel.ReadModelProjectorService.PaymentViewRow;
 import com.paycore.readmodel.ReadModelProjectorService.RebuildReport;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -51,6 +55,7 @@ class ReadModelIntegrationTest {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("paycore.readmodel.kafka-listener-enabled", () -> "false");
+        registry.add("paycore.security.admin-token", () -> "readmodel-test-admin");
     }
 
     @Autowired
@@ -63,12 +68,108 @@ class ReadModelIntegrationTest {
     private TestRestTemplate restTemplate;
 
     private UUID merchantId;
+    private String merchantApiKey;
 
     @BeforeEach
     void setUp() {
-        jdbcClient.sql("TRUNCATE TABLE payment_view, merchant_daily_summary, processed_events, read_model_event_log")
+        jdbcClient.sql("TRUNCATE TABLE payment_view, merchant_daily_summary, processed_events, read_model_event_log, read_model_poison_events")
                 .update();
         merchantId = UuidV7.generate();
+        jdbcClient.sql("CREATE TABLE IF NOT EXISTS merchants (id UUID PRIMARY KEY, api_key_hash VARCHAR(64) NOT NULL UNIQUE)")
+                .update();
+        merchantApiKey = "pc_live_test_" + merchantId;
+        jdbcClient.sql("INSERT INTO merchants (id, api_key_hash) VALUES (:id, :hash)")
+                .param("id", merchantId)
+                .param("hash", apiKeyHash(merchantApiKey))
+                .update();
+    }
+
+    @Test
+    @DisplayName("Malformed events are durably quarantined and duplicate poison payloads are idempotent")
+    void malformedEventsAreQuarantined() {
+        byte[] malformed = new byte[] {0x01, 0x02, (byte) 0xFF};
+
+        projectorService.ingestEvent(malformed);
+        projectorService.ingestEvent(malformed);
+
+        Long quarantined = jdbcClient.sql("SELECT COUNT(*) FROM read_model_poison_events")
+                .query(Long.class).single();
+        assertThat(quarantined).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("Merchant summary includes payouts and rebuild reproduces the payable balance")
+    void merchantSummaryIncludesPayoutsAndRebuilds() {
+        UUID paymentId = UuidV7.generate();
+        Instant now = Instant.parse("2026-10-11T10:00:00Z");
+        projectorService.ingestEvent(buildAuthorizedEvent(
+                UuidV7.generate(), paymentId, merchantId, 1L, 10_000L, "psp-payout", now));
+        projectorService.ingestEvent(buildCapturedEvent(
+                UuidV7.generate(), paymentId, merchantId, 2L, 10_000L, 290L, now.plusSeconds(1)));
+
+        UUID payoutId = UuidV7.generate();
+        byte[] payoutEvent = PaymentEvent.newBuilder()
+                .setEventId(UuidV7.generate().toString())
+                .setPaymentId(payoutId.toString())
+                .setMerchantId(merchantId.toString())
+                .setEventSeq(1)
+                .setEventType("payout.created")
+                .setOccurredAt(Timestamp.newBuilder().setSeconds(now.plusSeconds(2).getEpochSecond()).build())
+                .setPayout(PayoutCreated.newBuilder().setPayoutId(payoutId.toString())
+                        .setAmount(9_710L).setCurrency("INR").setLedgerTxnId(UuidV7.generate().toString()))
+                .build().toByteArray();
+        projectorService.ingestEvent(payoutEvent);
+
+        UUID usdPaymentId = UuidV7.generate();
+        Instant usdAt = now.plusSeconds(3);
+        projectorService.ingestEvent(PaymentEvent.newBuilder()
+                .setEventId(UuidV7.generate().toString()).setPaymentId(usdPaymentId.toString())
+                .setMerchantId(merchantId.toString()).setEventSeq(1).setEventType("payment.authorized")
+                .setOccurredAt(Timestamp.newBuilder().setSeconds(usdAt.getEpochSecond()).build())
+                .setAuthorized(PaymentAuthorized.newBuilder().setAmount(5_000L).setCurrency("USD").setPspRef("psp-usd"))
+                .build().toByteArray());
+        projectorService.ingestEvent(PaymentEvent.newBuilder()
+                .setEventId(UuidV7.generate().toString()).setPaymentId(usdPaymentId.toString())
+                .setMerchantId(merchantId.toString()).setEventSeq(2).setEventType("payment.captured")
+                .setOccurredAt(Timestamp.newBuilder().setSeconds(usdAt.plusSeconds(1).getEpochSecond()).build())
+                .setCaptured(PaymentCaptured.newBuilder().setCapturedAmount(5_000L).setFeeAmount(50L)
+                        .setCurrency("USD").setPspRef("psp-usd").setLedgerTxnId(UuidV7.generate().toString()))
+                .build().toByteArray());
+
+        MerchantSummaryResponse before = projectorService.getMerchantSummary(merchantId);
+        assertThat(before.currencies()).hasSize(2);
+        assertThat(before.currencies()).filteredOn(summary -> summary.currency().equals("INR"))
+                .singleElement().satisfies(summary -> {
+                    assertThat(summary.totalPayouts()).isEqualTo(9_710L);
+                    assertThat(summary.netMerchantAmount()).isZero();
+                    assertThat(summary.dailyBreakdown()).singleElement()
+                            .satisfies(day -> assertThat(day.payoutAmount()).isEqualTo(9_710L));
+                });
+        assertThat(before.currencies()).filteredOn(summary -> summary.currency().equals("USD"))
+                .singleElement().satisfies(summary -> {
+                    assertThat(summary.netMerchantAmount()).isEqualTo(4_950L);
+                    assertThat(summary.totalPayouts()).isZero();
+                });
+
+        projectorService.rebuildFromScratch();
+        assertThat(projectorService.getMerchantSummary(merchantId)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("A different event claiming an occupied payment sequence is quarantined")
+    void conflictingEventSequenceIsQuarantined() {
+        UUID paymentId = UuidV7.generate();
+        Instant now = Instant.parse("2026-10-11T10:00:00Z");
+        projectorService.ingestEvent(buildAuthorizedEvent(
+                UuidV7.generate(), paymentId, merchantId, 1L, 1_000L, "psp-conflict", now));
+        projectorService.ingestEvent(buildAuthorizedEvent(
+                UuidV7.generate(), paymentId, merchantId, 1L, 2_000L, "psp-conflict", now));
+
+        Long quarantined = jdbcClient.sql("SELECT COUNT(*) FROM read_model_poison_events")
+                .query(Long.class).single();
+        assertThat(quarantined).isEqualTo(1L);
+        assertThat(jdbcClient.sql("SELECT COUNT(*) FROM payment_view WHERE payment_id = :id AND amount = 1000")
+                .param("id", paymentId).query(Long.class).single()).isEqualTo(1L);
     }
 
     @Test
@@ -79,8 +180,9 @@ class ReadModelIntegrationTest {
 
         byte[] seq1Authorized = buildAuthorizedEvent(UuidV7.generate(), paymentId, merchantId, 1L, 10_000L, "psp_ref_1", now);
         byte[] seq2Captured = buildCapturedEvent(UuidV7.generate(), paymentId, merchantId, 2L, 10_000L, 290L, now.plusSeconds(5));
-        byte[] seq3Refund1 = buildRefundedEvent(UuidV7.generate(), paymentId, merchantId, 3L, 2_500L, 2_500L, now.plusSeconds(10));
-        byte[] seq4Refund2 = buildRefundedEvent(UuidV7.generate(), paymentId, merchantId, 4L, 1_500L, 4_000L, now.plusSeconds(20));
+        byte[] seq3Refund1 = buildRefundedEvent(UuidV7.generate(), paymentId, merchantId, 3L, 2_500L, 2_500L, 72L, now.plusSeconds(10));
+        byte[] seq4Refund2 = buildRefundedEvent(UuidV7.generate(), paymentId, merchantId, 4L, 1_500L, 4_000L, 44L, now.plusSeconds(20));
+        byte[] seq5FinalRefund = buildRefundedEvent(UuidV7.generate(), paymentId, merchantId, 5L, 6_000L, 10_000L, 174L, now.plusSeconds(30));
 
         // 1. Deliver seq 3 first (out-of-order gap: missing seq 1 and seq 2)
         projectorService.ingestEvent(seq3Refund1);
@@ -98,24 +200,32 @@ class ReadModelIntegrationTest {
         List<PaymentViewRow> rowsAfterDrain = projectorService.listPayments(merchantId, null, 10).items();
         assertThat(rowsAfterDrain).hasSize(1);
         PaymentViewRow view = rowsAfterDrain.get(0);
-        assertThat(view.status()).isEqualTo("CAPTURED");
+        assertThat(view.status()).isEqualTo("PARTIALLY_REFUNDED");
         assertThat(view.amount()).isEqualTo(10_000L);
         assertThat(view.capturedAmount()).isEqualTo(10_000L);
-        assertThat(view.feeAmount()).isEqualTo(290L);
+        assertThat(view.feeAmount()).isEqualTo(218L);
         assertThat(view.refundedAmount()).isEqualTo(2_500L);
         assertThat(view.lastEventSeq()).isEqualTo(3L);
 
         // 4. Deliver seq 4 and duplicate seq 1 + seq 3
         projectorService.ingestEvent(seq4Refund2);
+        assertThat(projectorService.listPayments(merchantId, null, 10).items().get(0).status())
+                .isEqualTo("PARTIALLY_REFUNDED");
+        projectorService.ingestEvent(seq5FinalRefund);
+        assertThat(projectorService.listPayments(merchantId, null, 10).items().get(0).status())
+                .isEqualTo("REFUNDED");
         projectorService.ingestEvent(seq1Authorized);
         projectorService.ingestEvent(seq3Refund1);
 
         MerchantSummaryResponse summary = projectorService.getMerchantSummary(merchantId);
-        assertThat(summary.totalCaptured()).isEqualTo(10_000L);
-        assertThat(summary.totalFees()).isEqualTo(290L);
-        assertThat(summary.totalRefunded()).isEqualTo(4_000L);
-        assertThat(summary.netMerchantAmount()).isEqualTo(10_000L - 290L - 4_000L);
-        assertThat(summary.paymentCount()).isEqualTo(1L);
+        assertThat(summary.currencies()).singleElement().satisfies(currency -> {
+            assertThat(currency.currency()).isEqualTo("INR");
+            assertThat(currency.totalCaptured()).isEqualTo(10_000L);
+            assertThat(currency.totalFees()).isZero();
+            assertThat(currency.totalRefunded()).isEqualTo(10_000L);
+            assertThat(currency.netMerchantAmount()).isZero();
+            assertThat(currency.paymentCount()).isEqualTo(1L);
+        });
     }
 
     @Test
@@ -132,7 +242,8 @@ class ReadModelIntegrationTest {
                     UuidV7.generate(), paymentId, merchantId, 2L, amt, fee, baseTime.plusSeconds(i + 1)));
             if (i % 3 == 0) {
                 projectorService.ingestEvent(buildRefundedEvent(
-                        UuidV7.generate(), paymentId, merchantId, 3L, 200L, 200L, baseTime.plusSeconds(i + 2)));
+                        UuidV7.generate(), paymentId, merchantId, 3L, 200L, 200L,
+                        Math.floorDiv(fee * 200L, amt), baseTime.plusSeconds(i + 2)));
             }
         }
 
@@ -143,7 +254,7 @@ class ReadModelIntegrationTest {
         while (true) {
             String url = "/v1/payments?limit=5" + (cursor != null ? "&cursor=" + cursor : "");
             HttpHeaders headers = new HttpHeaders();
-            headers.set("X-Merchant-Id", merchantId.toString());
+            headers.set("X-API-Key", merchantApiKey);
             ResponseEntity<CursorPage<PaymentViewRow>> pageResp = restTemplate.exchange(
                     url,
                     HttpMethod.GET,
@@ -167,8 +278,11 @@ class ReadModelIntegrationTest {
         MerchantSummaryResponse beforeRebuild = projectorService.getMerchantSummary(merchantId);
 
         // Trigger POST /v1/admin/read-model/rebuild (truncates projection tables and replays from offset 0)
-        ResponseEntity<RebuildReport> rebuildResp =
-                restTemplate.postForEntity("/v1/admin/read-model/rebuild", null, RebuildReport.class);
+        HttpHeaders adminHeaders = new HttpHeaders();
+        adminHeaders.set("X-PayCore-Admin-Token", "readmodel-test-admin");
+        ResponseEntity<RebuildReport> rebuildResp = restTemplate.exchange(
+                "/v1/admin/read-model/rebuild", HttpMethod.POST,
+                new HttpEntity<>(null, adminHeaders), RebuildReport.class);
         assertThat(rebuildResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         RebuildReport report = rebuildResp.getBody();
         assertThat(report).isNotNull();
@@ -178,6 +292,25 @@ class ReadModelIntegrationTest {
         // Verify post-rebuild summary matches pre-rebuild summary paise-for-paise
         MerchantSummaryResponse afterRebuild = projectorService.getMerchantSummary(merchantId);
         assertThat(afterRebuild).isEqualTo(beforeRebuild);
+    }
+
+    @Test
+    @DisplayName("Merchant reads reject caller-supplied identity without a valid API key")
+    void merchantReadsRejectSpoofedMerchantIdHeader() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Merchant-Id", merchantId.toString());
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/v1/payments", HttpMethod.GET, new HttpEntity<>(headers), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    private String apiKeyHash(String rawKey) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(rawKey.getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException(impossible);
+        }
     }
 
     private byte[] buildAuthorizedEvent(
@@ -218,7 +351,8 @@ class ReadModelIntegrationTest {
     }
 
     private byte[] buildRefundedEvent(
-            UUID eventId, UUID paymentId, UUID merchantId, long seq, long refundAmt, long totalRefunded, Instant at) {
+            UUID eventId, UUID paymentId, UUID merchantId, long seq, long refundAmt, long totalRefunded,
+            long feeReversed, Instant at) {
         return PaymentEvent.newBuilder()
                 .setEventId(eventId.toString())
                 .setPaymentId(paymentId.toString())
@@ -230,6 +364,7 @@ class ReadModelIntegrationTest {
                         .setRefundId(UuidV7.generate().toString())
                         .setRefundAmount(refundAmt)
                         .setTotalRefundedAmount(totalRefunded)
+                        .setFeeReversedAmount(feeReversed)
                         .setCurrency("INR")
                         .setLedgerTxnId(UuidV7.generate().toString())
                         .build())

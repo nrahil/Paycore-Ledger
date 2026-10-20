@@ -1,4 +1,4 @@
-# PayCore Ledger — Production-Grade Payment Orchestration & Double-Entry Ledger Engine
+# PayCore Ledger — Payment Orchestration & Double-Entry Ledger
 
 [![CI Pipeline](https://github.com/Juixe7/Paycore-Ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/Juixe7/Paycore-Ledger/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -8,6 +8,8 @@
 [![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL-16-336791.svg)](https://www.postgresql.org/)
 [![Kafka/Redpanda](https://img.shields.io/badge/Streaming-Redpanda%2FKafka-red.svg)](https://redpanda.com/)
 [![Observability](https://img.shields.io/badge/Observability-Prometheus%20%7C%20Grafana%20%7C%20Jaeger-purple.svg)](http://localhost:3001)
+
+PayCore is a local payment orchestration and ledger project. It uses a mock PSP and local infrastructure; it does not process real payments.
 
 ---
 
@@ -55,27 +57,27 @@
 ## 1. Executive Summary
 
 ### 1.1 Core Problem Statement
-Modern payment platforms (such as Stripe, Adyen, and Razorpay) operate in an environment of asynchronous, unreliable external third-party Payment Service Providers (PSPs), flaky networks, and pathological concurrent retry traffic. Conventional CRUD architectures built on top of traditional Object-Relational Mapping (ORM) frameworks fail catastrophically in this domain due to:
-1. **Financial Drift & Non-Auditable Mutations**: Storing balances as mutable scalar columns (`account_balance = account_balance + ?`) allows silent data corruption, rounding drift, and zero cryptographic or mathematical audit trails.
-2. **Connection Pool Starvation**: Holding database connections open across slow, blocking external PSP HTTP roundtrips (100 ms – 2,000 ms) exhausts database connection pools (HikariCP), stalling unrelated transactions and leading to cascading platform-wide outages.
-3. **Concurrent Over-Refund and Double-Charge Race Conditions**: High-frequency parallel client retries or simultaneous refund attempts bypass naive application-level checks, resulting in duplicate charges or cumulative refunds exceeding 100% of captured transaction amounts.
-4. **Dual-Write Discrepancies**: Publishing events to message brokers (Kafka) and updating database records independently introduces distributed inconsistencies when either step fails midway.
+Payment workflows must handle retries, concurrent requests, slow or unavailable PSPs, and events consumed asynchronously. This project explores several ways to keep those workflows consistent:
+1. **Auditable money movement**: balances are derived from ledger entries instead of being updated as independent totals.
+2. **Database connection usage**: PSP requests run outside the database transaction so a slow network call does not hold a database connection for its duration.
+3. **Retries and concurrent operations**: idempotency records and database locking protect against duplicate captures and over-refunds.
+4. **State changes and events**: a transactional outbox records events with the corresponding database update; downstream delivery is at least once and consumers handle duplicates.
 
 ### 1.2 Technical Philosophy & Invariants
-**PayCore Ledger** is an enterprise-grade payment orchestration and double-entry bookkeeping engine designed around strict mathematical invariants, defensive database primitives, and explicit concurrency control:
-* **Strict Double-Entry Invariant**: Every monetary movement is an immutable journal transaction where $\sum \text{Debits} \equiv \sum \text{Credits}$ within the same currency. Global ledger drift must evaluate to exactly $0\text{ paise}$ at all times.
-* **Non-Blocking External I/O**: Database connections are released prior to initiating network I/O with upstream acquirers. Long-running PSP network calls are executed on JDK 21 Virtual Threads isolated by Resilience4j Bulkheads and Circuit Breakers.
+**PayCore Ledger** is organized around a small set of accounting and workflow invariants:
+* **Double-entry ledger**: each posted journal transaction balances debits and credits within its currency. The invariant checker and database constraints are intended to reject unbalanced transactions; integration tests verify zero ledger drift for the exercised scenarios.
+* **PSP calls outside database transactions**: The service releases its database transaction before calling the PSP. PSP calls run on JDK 21 Virtual Threads and use Resilience4j bulkhead and circuit-breaker limits.
 * **Database-Enforced Guardrails**: Correctness does not rely solely on application code. Integrity is anchored at the database engine level via deferred constraint triggers, check constraints, append-only mutation blocks, and lexicographically sorted pessimistic row locks (`SELECT ... FOR UPDATE`).
-* **Authoritative Idempotency & Guaranteed Event Delivery**: Distributed requests are protected via cryptographic request payload hashing and transactional outbox tables committed atomically alongside domain state changes.
+* **Idempotency and outbox delivery**: request payload hashes detect reuse of idempotency keys with different requests. Outbox rows commit with domain changes and are delivered at least once to consumers.
 
 ### 1.3 High-Level Technology Matrix
 
 | Layer / Concern | Technology Stack | Architectural Purpose |
 | :--- | :--- | :--- |
-| **Edge Ingress Gateway** | Go 1.22 (`net/http/httputil`) | Low-latency reverse proxy, SHA-256 API key authentication, per-merchant token-bucket rate limiting, W3C `traceparent` propagation. |
-| **Domain Orchestration** | Java 21, Spring Boot 3.3.5 | Virtual Threads (`Thread.ofVirtual()`), Spring `JdbcClient` (zero ORM magic), HikariCP connection management. |
+| **Edge Ingress Gateway** | Go 1.22 (`net/http/httputil`, OpenTelemetry) | Reverse proxy, SHA-256 API-key authentication, per-merchant token-bucket rate limiting, W3C trace propagation, and OTLP-exported gateway spans. |
+| **Domain Orchestration** | Java 21, Spring Boot 3.3.5 | Virtual Threads (`Thread.ofVirtual()`), Spring `JdbcClient` with explicit SQL, HikariCP connection management. |
 | **Data Persistence** | PostgreSQL 16 | Partitioned tables (monthly ranges), PL/pgSQL deferred constraint triggers, composite B-Tree indexes, row-level locks. |
-| **Event Streaming** | Redpanda (Kafka 3.x compatible), Protobuf v3 | High-throughput transactional outbox CDC streaming with backward-compatible binary serialization. |
+| **Event Streaming** | Redpanda (Kafka-compatible), Protobuf v3 | A polling outbox relay publishes versioned payment events for downstream consumers. |
 | **Caching & In-Flight Locks** | Redis 7 | Sub-millisecond idempotent response caching and fast-path request deduplication. |
 | **Fault Tolerance & Resilience** | Resilience4j 2.2.0 | Time-limited bulkheads, circuit breakers, backoff retry queues, and Dead Letter Queues (DLQ). |
 | **Observability & Metrics** | Prometheus, Grafana, OpenTelemetry, Jaeger | Custom Micrometer gauges (`ledger_drift_paise`), HTTP latency distribution (p50/p95/p99), and distributed W3C tracing. |
@@ -268,7 +270,7 @@ $$\text{DEBIT } \text{PSP\_RECEIVABLE} \equiv \text{CREDIT } \text{MERCHANT\_PAY
 In high-throughput platforms, locking a single global `PSP_RECEIVABLE` row creates severe database thread contention. PayCore routes global accounts across 16 deterministic sub-accounts:
 $$\text{shard\_index} = \text{Math.floorMod}(\text{paymentId.hashCode}(), 16)$$
 
-* **Deadlock Elimination**: When locking accounts in [`LedgerService.java`](payments-core/src/main/java/com/paycore/payments/ledger/LedgerService.java), involved account IDs are sorted lexicographically before executing `SELECT ... FOR UPDATE`, guaranteeing identical lock acquisition order across all threads.
+* **Consistent lock ordering**: [`LedgerService.java`](payments-core/src/main/java/com/paycore/payments/ledger/LedgerService.java) sorts account IDs before acquiring `SELECT ... FOR UPDATE` locks, reducing deadlock risk for multi-account postings.
 * **Database-Level Invariant Enforcement**:
   ```sql
   -- PL/pgSQL Deferred Constraint Trigger (Fires at COMMIT)
@@ -311,11 +313,12 @@ Downstream, `webhook-service`:
 * Applies tiered exponential backoff across 5 distinct retry queues (`1m`, `5m`, `30m`, `2h`, `6h`) before redirecting permanently failed attempts to the Dead Letter Queue (`DLQ`).
 
 ### 4.5 T+1 Settlement Reconciliation
-The `reconciliation` service parses external acquirer settlement CSV exports and executes a 4-way differential audit against internal ledger records:
+The `reconciliation` service parses date-scoped acquirer settlement CSV exports and compares each PSP reference, status, currency, and amount with the matching payment and its PSP-receivable ledger postings for that UTC day. Capture postings are positive settlement movements; later refund postings are negative movements on their own ledger dates. Four-column legacy files default to INR; new exports include currency. Duplicate references, malformed rows, and rows from a different settlement date are rejected instead of being silently overwritten:
 1. `MISSING_IN_LEDGER`: Record present in PSP file but absent in PayCore ledger.
 2. `MISSING_IN_PSP_FILE`: Internal capture exists but is missing from the PSP settlement.
-3. `AMOUNT_MISMATCH`: Net captured minus refunded amounts disagree with settled values.
+3. `AMOUNT_MISMATCH`: The PSP daily movement disagrees with that day's ledger postings; refund movements are negative.
 4. `STATUS_MISMATCH`: Finalized states diverge (e.g., PSP reports refunded, ledger reports captured).
+5. `CURRENCY_MISMATCH`: PSP and payment currencies differ.
 
 ---
 
@@ -328,13 +331,13 @@ The `reconciliation` service parses external acquirer settlement CSV exports and
 * **`ResilientPspClient`**: Gateway client invoking external PSP HTTP endpoints guarded by Resilience4j Bulkheads (`maxConcurrentCalls=256`), Circuit Breakers (`failureRateThreshold=50%`), and 1,500 ms timeouts.
 
 ### 5.2 `gateway`
-* **`Gateway` (`main.go`)**: Reverse proxy maintaining per-merchant token buckets in a concurrent map (`sync.Map`). Computes SHA-256 hashes of client API keys (`X-API-Key`) and validates them against internal routing caches while injecting W3C OpenTelemetry headers (`traceparent`).
+* **`Gateway` (`main.go`)**: Reverse proxy maintaining per-key token buckets in a concurrent map (`sync.Map`) and injecting W3C trace headers. The gateway checks that merchant routes carry an API key; the receiving service validates the key and derives the merchant identity.
 
 ### 5.3 `webhook-service`
 * **`WebhookDeliveryService`**: Consumes Protobuf messages from Kafka, fetches registered merchant endpoints, computes HMAC-SHA256 signatures, filters malicious IP ranges, and dispatches HTTP webhooks with jittered backoff.
 
 ### 5.4 `read-model-service`
-* **`ReadModelProjectorService`**: CQRS query service. Ingests domain events, tracks monotonic `event_seq` per aggregate, buffers out-of-order sequence arrivals in `projection_event_buffer`, and maintains a denormalized query table (`payment_view`).
+* **`ReadModelProjectorService`**: CQRS query service. Ingests domain events, tracks monotonic `event_seq` per payment, buffers gaps in `read_model_event_log`, quarantines malformed or conflicting events, and rebuilds payment and merchant summary projections from that log. Merchant summaries separate currencies; each currency's net payable subtracts refunds, net fees, and completed payouts. The projection is eventually consistent and is not a live ledger balance.
 
 ### 5.5 `reconciliation`
 * **`ReconciliationService`**: Ingests settlement feeds via HTTP multipart uploads or automated triggers, evaluates financial parity against `ledger_transactions`, and logs structured discrepancies in `recon_discrepancies`.
@@ -357,9 +360,11 @@ The `reconciliation` service parses external acquirer settlement CSV exports and
 | `POST` | `/v1/payments/{id}/void` | Cancels an uncaptured authorization hold. | `X-API-Key` | `X-Idempotency-Key` | `200 OK` |
 | `GET` | `/v1/payments/{id}/ledger` | Audits debits and credits posted for a specific payment. | `X-API-Key` | No | `200 OK` |
 | `POST` | `/v1/payouts` | Withdraws funds from merchant payable to external bank. | `X-API-Key` | `X-Idempotency-Key` | `201 Created` |
-| `GET` | `/v1/admin/invariants` | Verifies global double-entry invariants ($\sum D = \sum C$). | `X-API-Key` | No | `200 OK` |
-| `POST` | `/v1/admin/ledger/sharding` | Toggles 16-way account sharding (`enabled=true/false`). | `X-API-Key` | No | `200 OK` |
-| `POST` | `/v1/recon/jobs` | Ingests settlement CSV file and runs reconciliation. | `X-API-Key` | No | `200 OK` |
+| `GET` | `/v1/admin/invariants` | Verifies global double-entry invariants ($\sum D = \sum C$). | `X-PayCore-Admin-Token` | No | `200 OK` |
+| `POST` | `/v1/admin/ledger/sharding` | Toggles 16-way account sharding (`enabled=true/false`). | `X-PayCore-Admin-Token` | No | `200 OK` |
+| `POST` | `/v1/admin/reconciliation` | Ingests settlement CSV or JSON and runs reconciliation. | `X-PayCore-Admin-Token` | No | `200 OK` |
+
+Configure a high-entropy `PAYCORE_ADMIN_TOKEN` in each service environment to enable `/v1/admin/**` endpoints. The services reject admin requests when the token is missing or invalid; do not reuse a merchant API key as an operator credential.
 
 ### 6.2 Key Request & Response DTOs
 
@@ -429,6 +434,8 @@ The `reconciliation` service parses external acquirer settlement CSV exports and
 | `REDIS_ENABLED` | `false` | `payments-core` | Toggle enabling non-authoritative Redis caching. |
 | `PSP_BASE_URL` | `http://localhost:8085` | `payments-core` | Target URL for external Payment Service Provider calls. |
 | `PSP_TIMEOUT_MS` | `1500` | `payments-core` | Connect and read timeout for external PSP HTTP calls. |
+| `PAYCORE_ADMIN_TOKEN` | (required to enable admin APIs) | JVM services and mock PSP | Separate operator credential for `/v1/admin/**` and PSP fault controls. |
+| `PAYCORE_INTERNAL_TOKEN` | (required for PSP HTTP mode) | `payments-core`, `mock-psp`, read-model service | Shared secret for trusted service-to-service endpoints; never expose it to merchant clients. |
 | `RESOLVER_INTERVAL_MS`| `5000` | `payments-core` | Frequency (ms) of the stuck `AUTHORIZING` recovery job. |
 | `SHARDED_FEE_ACCOUNTS` | `false` | `payments-core` | Boot flag enabling 16-way `PSP_RECEIVABLE` sharding. |
 | `GATEWAY_RPS` | `100` | `gateway` | Sustained rate limit capacity per merchant token bucket. |
@@ -450,6 +457,8 @@ Spin up PostgreSQL, Redpanda, Redis, Prometheus, Grafana, and Jaeger in Docker:
 docker compose -f deploy/docker-compose.lite.yml up -d
 ```
 
+PostgreSQL, Redis, Prometheus, and Grafana use named Docker volumes so their state survives container recreation. The local Grafana password defaults to `paycore-local-only`; set `GRAFANA_ADMIN_PASSWORD` before its first start if the host is shared. Grafana provisions its Prometheus datasource and PayCore dashboard automatically.
+
 Verify healthy container status:
 ```bash
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
@@ -463,6 +472,10 @@ Build all service JARs via Gradle:
 
 Launch the microservices in separate terminal sessions or background jobs:
 ```powershell
+# Use high-entropy values. Set these in each service process environment; configure the same internal token in core and mock-psp.
+$env:PAYCORE_ADMIN_TOKEN = "<ADMIN_TOKEN>"
+$env:PAYCORE_INTERNAL_TOKEN = "<INTERNAL_SERVICE_TOKEN>"
+
 # 1. Mock Acquirer (Port 8085)
 java -jar mock-psp/build/libs/mock-psp-0.1.0-SNAPSHOT.jar --server.port=8085
 
@@ -483,7 +496,7 @@ java -jar payments-core/build/libs/payments-core-0.1.0-SNAPSHOT.jar --server.por
 ```bash
 cd gateway
 go run main.go
-# Gateway starts listening on :8080, reverse-proxying to payments-core (:8081)
+# Gateway starts listening on :8090, reverse-proxying to payments-core (:8081)
 ```
 
 ### 8.5 Step 4: Running Automated End-to-End Live Demo
@@ -499,12 +512,48 @@ The script executes:
 5. Atomic partial refund.
 6. Real-time audit of `/v1/admin/invariants` asserting `globalImbalance == 0`.
 
+Create and verify a SQL backup from the local Compose PostgreSQL container:
+```powershell
+.\scripts\backup-restore-verify.ps1
+```
+The script keeps the backup and restored scratch database, refuses to overwrite either, compares restored ledger transaction counts, and checks that every restored ledger transaction balances by currency. Store backup files outside the repository and test the restore procedure after schema or deployment changes.
+
+#### Kubernetes manifest scope
+`deploy/k8s/paycore-workloads.yaml` contains the application workloads and Services. It expects a Kubernetes cluster with the CloudNativePG operator and `deploy/k8s/cnpg-postgres-cluster.yaml` applied, plus a reachable Redpanda-compatible broker at the address in the `paycore-runtime` ConfigMap. Create the runtime credentials before deploying workloads (use a secret manager or encrypted secret workflow for non-local environments):
+```bash
+kubectl -n paycore create secret generic paycore-runtime-secrets \
+  --from-literal=admin-token="$PAYCORE_ADMIN_TOKEN" \
+  --from-literal=internal-token="$PAYCORE_INTERNAL_TOKEN"
+```
+CloudNativePG creates `paycore-pg-app` for the database credentials. The ConfigMap holds service discovery and the broker endpoint; change these values for the target cluster. The manifest is a deployment example; the repository does not provision the broker/operator or production secret management.
+
 ### 8.6 Observability & Developer Dashboards
 * **Swagger UI API Explorer**: [http://localhost:8081/swagger-ui/index.html](http://localhost:8081/swagger-ui/index.html)
-* **Grafana Operational Dashboard**: [http://localhost:3001](http://localhost:3001) (`admin` / `admin`)
+* **Grafana Operational Dashboard**: [http://localhost:3001](http://localhost:3001) (`admin` / `paycore-local-only` by default; configurable with `GRAFANA_ADMIN_PASSWORD`)
   * Pre-configured Dashboard: [http://localhost:3001/d/paycore-overview](http://localhost:3001/d/paycore-overview)
 * **Prometheus Metrics Scraper**: [http://localhost:9090](http://localhost:9090)
 * **Jaeger Distributed Tracing**: [http://localhost:16686](http://localhost:16686)
+  * Local defaults: Spring services export OTLP/HTTP to Jaeger on port `4318`; the Go gateway exports OTLP/gRPC to port `4317`.
+
+#### Local observability evidence
+
+The following screenshots and metrics were captured from the local Docker Compose stack after running the payment flow with two k6 virtual users for 30 seconds. They demonstrate a local functional/load smoke test; they are not a production capacity benchmark.
+
+![Grafana PayCore dashboard during the local k6 payment flow](docs/observability-assets/grafana-k6-local.png)
+
+![Jaeger trace for a payment request across the gateway, payments-core, and mock PSP](docs/observability-assets/jaeger-payment-flow.png)
+
+Reproduce the flow after starting the services and creating a merchant in Swagger (`POST /v1/merchants`). Set the merchant API key returned by that endpoint, then run k6 in Docker:
+
+```powershell
+$env:PAYCORE_API_KEY = "<merchant API key>"
+$loadPath = (Resolve-Path .\load).Path
+docker run --rm --mount "type=bind,source=$loadPath,target=/scripts,readonly" `
+  -e PAYCORE_URL=http://host.docker.internal:8090 `
+  -e PAYCORE_API_KEY grafana/k6 run /scripts/k6-local-demo.js
+```
+
+The screenshots correspond to a local run with **180 completed payment flows**, **540/540 successful checks**, **0% failed HTTP requests**, and a **274.56 ms capture-request p95**. A concise result record is available at [`docs/observability-assets/k6-local-demo-results.json`](docs/observability-assets/k6-local-demo-results.json).
 
 ---
 
@@ -515,7 +564,7 @@ The script executes:
 sequenceDiagram
     autonumber
     actor Merchant as Merchant Client
-    participant Gateway as Go Gateway (:8080)
+    participant Gateway as Go Gateway (:8090)
     participant Core as payments-core (:8081)
     participant DB as PostgreSQL 16
     participant PSP as Mock PSP (:8085)
@@ -594,9 +643,9 @@ flowchart LR
 ### 10.2 Inspecting Global Financial Integrity
 To verify that zero mathematical drift exists across the system at any given moment:
 ```bash
-curl -s -H "X-API-Key: <MERCHANT_KEY>" http://localhost:8081/v1/admin/invariants | jq .
+curl -s -H "X-PayCore-Admin-Token: <ADMIN_TOKEN>" http://localhost:8081/v1/admin/invariants | jq .
 ```
-Expected production response:
+Example response:
 ```json
 {
   "status": "PASS",
@@ -611,9 +660,6 @@ Expected production response:
 
 ## 11. Verification & Empirical Benchmarks
 
-PayCore includes full empirical verification suites validating all concurrency and performance claims under production conditions:
-* **Concurrency Torture Suite** ([`ConcurrencyAndCrashTortureTest.java`](payments-core/src/test/java/com/paycore/payments/ConcurrencyAndCrashTortureTest.java)): 500 parallel same-key threads, 100 concurrent partial refunds, and 1,000 fault-injected server crash cycles.
-* **16-Way Sharding Benchmark** ([`StretchAbBenchmarkTest.java`](payments-core/src/test/java/com/paycore/payments/StretchAbBenchmarkTest.java)): Proven **`4.46x` reduction in p50 capture latency** (261 ms vs 1,165 ms) under 64-thread contention.
-* **Virtual Threads vs Platform Pool Benchmark**: Proven **`2.68x` throughput improvement** (295 ms vs 790 ms) during 80 ms PSP network latency.
+The automated test suite covers ledger invariants, idempotency, concurrent captures and refunds, outbox recovery, webhook delivery, read-model projection, and reconciliation. These tests run locally with PostgreSQL and other test dependencies; they are not production certification or a service-level guarantee.
 
-For detailed hardware specifications, methodology, and raw test logs, consult [`EVIDENCE.md`](EVIDENCE.md) and [`INTERVIEW_DEFENSE.md`](INTERVIEW_DEFENSE.md).
+The A/B tests in [`StretchAbBenchmarkTest.java`](payments-core/src/test/java/com/paycore/payments/StretchAbBenchmarkTest.java) compare account sharding and virtual-thread execution under defined test workloads. Their timings depend on the machine and test environment. See [`EVIDENCE.md`](EVIDENCE.md) for the recorded scenarios and results.

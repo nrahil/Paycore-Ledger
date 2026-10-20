@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -10,6 +8,8 @@ services:
       POSTGRES_PASSWORD: paycore
     ports:
       - "5432:5432"
+    volumes:
+      - paycore-postgres-data:/var/lib/postgresql/data
     command:
       - "postgres"
       - "-c"
@@ -27,6 +27,8 @@ services:
     container_name: paycore-redis
     ports:
       - "6379:6379"
+    volumes:
+      - paycore-redis-data:/data
     command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -71,19 +73,34 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - paycore-prometheus-data:/prometheus
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
 
   grafana:
     image: grafana/grafana:11.1.0
     container_name: paycore-grafana
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-paycore-local-only}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - paycore-grafana-data:/var/lib/grafana
     ports:
       - "3001:3000"
     depends_on:
       - prometheus
+
+volumes:
+  paycore-postgres-data:
+  paycore-redis-data:
+  paycore-prometheus-data:
+  paycore-grafana-data:

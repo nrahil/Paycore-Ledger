@@ -3,6 +3,19 @@ kind: Namespace
 metadata:
   name: paycore
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paycore-runtime
+  namespace: paycore
+data:
+  KAFKA_BOOTSTRAP_SERVERS: "redpanda.paycore.svc.cluster.local:9092"
+  PSP_BASE_URL: "http://mock-psp:8085"
+  PAYMENTS_CORE_URL: "http://payments-core:8080"
+  WEBHOOK_SERVICE_URL: "http://webhook-service:8082"
+  READ_MODEL_URL: "http://read-model-service:8083"
+  RECONCILIATION_URL: "http://reconciliation:8084"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,11 +42,25 @@ spec:
           ports:
             - containerPort: 8080
           env:
+            - name: PORT
+              value: "8080"
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://paycore-pg-rw.paycore.svc.cluster.local:5432/paycore
-            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
-              value: redpanda.paycore.svc.cluster.local:9092
-            - name: PAYCORE_LEDGER_SHARDED_FEE_ACCOUNTS
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: password}}
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: KAFKA_BOOTSTRAP_SERVERS}}
+            - name: PSP_BASE_URL
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: PSP_BASE_URL}}
+            - name: PAYCORE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: admin-token}}
+            - name: PAYCORE_INTERNAL_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: internal-token}}
+            - name: OUTBOX_RELAY_ENABLED
+              value: "true"
+            - name: SHARDED_FEE_ACCOUNTS
               value: "true"
           resources:
             requests:
@@ -47,6 +74,10 @@ spec:
               path: /healthz
               port: 8080
             initialDelaySeconds: 15
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /healthz, port: 8080}
+            failureThreshold: 30
             periodSeconds: 10
           readinessProbe:
             httpGet:
@@ -112,9 +143,21 @@ spec:
           ports:
             - containerPort: 8083
           env:
+            - name: PORT
+              value: "8083"
             - name: SPRING_DATASOURCE_URL
-              value: jdbc:postgresql://paycore-pg-ro.paycore.svc.cluster.local:5432/paycore
-            - name: PAYCORE_READMODEL_KAFKA_ENABLED
+              value: jdbc:postgresql://paycore-pg-rw.paycore.svc.cluster.local:5432/paycore
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: password}}
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: KAFKA_BOOTSTRAP_SERVERS}}
+            - name: PAYCORE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: admin-token}}
+            - name: PAYCORE_INTERNAL_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: internal-token}}
+            - name: PAYCORE_READMODEL_KAFKA_LISTENER_ENABLED
               value: "true"
           livenessProbe:
             httpGet:
@@ -150,6 +193,21 @@ spec:
           image: paycore/webhook-service:latest
           ports:
             - containerPort: 8082
+          env:
+            - name: PORT
+              value: "8082"
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://paycore-pg-rw.paycore.svc.cluster.local:5432/paycore
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: password}}
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: KAFKA_BOOTSTRAP_SERVERS}}
+            - name: PAYCORE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: admin-token}}
+            - name: KAFKA_LISTENER_ENABLED
+              value: "true"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -158,6 +216,68 @@ spec:
             httpGet:
               path: /readyz
               port: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-psp
+  namespace: paycore
+  labels: {app: mock-psp}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mock-psp}
+  template:
+    metadata:
+      labels: {app: mock-psp}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65532}
+      containers:
+        - name: mock-psp
+          image: paycore/mock-psp:latest
+          ports: [{containerPort: 8085}]
+          env:
+            - name: PORT
+              value: "8085"
+            - name: PAYCORE_INTERNAL_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: internal-token}}
+            - name: PAYCORE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: admin-token}}
+          livenessProbe: {httpGet: {path: /healthz, port: 8085}}
+          readinessProbe: {httpGet: {path: /readyz, port: 8085}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconciliation
+  namespace: paycore
+  labels: {app: reconciliation}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: reconciliation}
+  template:
+    metadata:
+      labels: {app: reconciliation}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65532}
+      containers:
+        - name: reconciliation
+          image: paycore/reconciliation:latest
+          ports: [{containerPort: 8084}]
+          env:
+            - name: PORT
+              value: "8084"
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://paycore-pg-rw.paycore.svc.cluster.local:5432/paycore
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: paycore-pg-app, key: password}}
+            - name: PAYCORE_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: paycore-runtime-secrets, key: admin-token}}
+          livenessProbe: {httpGet: {path: /healthz, port: 8084}}
+          readinessProbe: {httpGet: {path: /readyz, port: 8084}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -192,6 +312,60 @@ spec:
             httpGet:
               path: /readyz
               port: 8090
+          env:
+            - name: GATEWAY_LISTEN_ADDR
+              value: ":8090"
+            - name: PAYMENTS_CORE_URL
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: PAYMENTS_CORE_URL}}
+            - name: WEBHOOK_SERVICE_URL
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: WEBHOOK_SERVICE_URL}}
+            - name: READ_MODEL_URL
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: READ_MODEL_URL}}
+            - name: RECONCILIATION_URL
+              valueFrom: {configMapKeyRef: {name: paycore-runtime, key: RECONCILIATION_URL}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: payments-core, namespace: paycore}
+spec:
+  selector: {app: payments-core}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: read-model-service, namespace: paycore}
+spec:
+  selector: {app: read-model-service}
+  ports: [{name: http, port: 8083, targetPort: 8083}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: webhook-service, namespace: paycore}
+spec:
+  selector: {app: webhook-service}
+  ports: [{name: http, port: 8082, targetPort: 8082}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mock-psp, namespace: paycore}
+spec:
+  selector: {app: mock-psp}
+  ports: [{name: http, port: 8085, targetPort: 8085}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: reconciliation, namespace: paycore}
+spec:
+  selector: {app: reconciliation}
+  ports: [{name: http, port: 8084, targetPort: 8084}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: gateway, namespace: paycore}
+spec:
+  type: NodePort
+  selector: {app: gateway}
+  ports: [{name: http, port: 8090, targetPort: 8090, nodePort: 30090}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

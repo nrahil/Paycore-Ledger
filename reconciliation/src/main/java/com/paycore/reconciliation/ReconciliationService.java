@@ -3,17 +3,20 @@ package com.paycore.reconciliation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paycore.common.clock.ClockProvider;
 import com.paycore.common.ids.UuidV7;
-import java.io.BufferedReader;
-import java.io.StringReader;
+import java.io.IOException;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
@@ -39,7 +42,8 @@ public class ReconciliationService {
         MISSING_IN_LEDGER,
         MISSING_IN_PSP_FILE,
         AMOUNT_MISMATCH,
-        STATUS_MISMATCH
+        STATUS_MISMATCH,
+        CURRENCY_MISMATCH
     }
 
     private final JdbcClient jdbcClient;
@@ -55,8 +59,8 @@ public class ReconciliationService {
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ReconRunReport runReconciliation(LocalDate settlementDate, String csvContent) {
-        Map<String, PspSettlementRow> csvRowsByPspRef = parseSettlementCsv(csvContent);
-        Map<String, InternalPaymentRecord> internalByPspRef = loadInternalPayments(settlementDate);
+        Map<String, PspSettlementRow> csvRowsByPspRef = parseSettlementCsv(csvContent, settlementDate);
+        Map<String, InternalPaymentRecord> internalByPspRef = loadInternalPayments(settlementDate, csvRowsByPspRef.keySet());
 
         UUID runId = UuidV7.generate();
         Instant now = clockProvider.now();
@@ -102,6 +106,14 @@ public class ReconciliationService {
                 continue;
             }
 
+            if (!pspRow.currency().equals(internal.currency())) {
+                discrepancies.add(new DiscrepancyRecord(
+                        UuidV7.generate(), runId, pspRow.pspRef(), internal.paymentId(),
+                        DiscrepancyKind.CURRENCY_MISMATCH, null, null,
+                        Map.of("expectedCurrency", internal.currency(), "actualCurrency", pspRow.currency())));
+                continue;
+            }
+
             // Verify amount
             long expectedAmt = internal.expectedSettlementAmount();
             if (expectedAmt != pspRow.amount()) {
@@ -124,7 +136,7 @@ public class ReconciliationService {
         }
 
         // 2. Check every internal CAPTURED / PARTIALLY_REFUNDED / REFUNDED payment (with a psp_ref) to see if it is missing from the PSP CSV
-        for (InternalPaymentRecord internal : internalByPspRef.values()) {
+        for (InternalPaymentRecord internal : loadCapturedPaymentsForDate(settlementDate)) {
             if (("CAPTURED".equals(internal.status())
                             || "PARTIALLY_REFUNDED".equals(internal.status())
                             || "REFUNDED".equals(internal.status()))
@@ -238,41 +250,56 @@ public class ReconciliationService {
         };
     }
 
-    private Map<String, PspSettlementRow> parseSettlementCsv(String csvContent) {
+    private Map<String, PspSettlementRow> parseSettlementCsv(String csvContent, LocalDate settlementDate) {
         Map<String, PspSettlementRow> map = new LinkedHashMap<>();
         if (csvContent == null || csvContent.isBlank()) {
             return map;
         }
-        try (BufferedReader reader = new BufferedReader(new StringReader(csvContent.trim()))) {
-            String line;
+        try (CSVParser parser = CSVParser.parse(csvContent, CSVFormat.DEFAULT)) {
             boolean firstLine = true;
-            while ((line = reader.readLine()) != null) {
-                String trimmed = line.trim();
-                if (trimmed.isEmpty()) {
-                    continue;
-                }
-                if (firstLine && trimmed.toLowerCase().startsWith("psp_ref")) {
+            for (CSVRecord record : parser) {
+                if (record.size() == 0) continue;
+                if (firstLine && record.get(0).trim().equalsIgnoreCase("psp_ref")) {
                     firstLine = false;
                     continue;
                 }
                 firstLine = false;
-                String[] parts = trimmed.split(",", -1);
-                if (parts.length < 4) {
-                    throw new IllegalArgumentException("Invalid CSV line (expected psp_ref,amount,status,settled_at): " + trimmed);
+                if (record.size() != 4 && record.size() != 5) {
+                    throw new IllegalArgumentException("Invalid CSV record " + record.getRecordNumber()
+                            + "; expected 4 columns and optional currency");
                 }
-                String pspRef = parts[0].trim();
-                long amount = Long.parseLong(parts[1].trim());
-                String status = parts[2].trim();
-                String settledAt = parts[3].trim();
-                map.put(pspRef, new PspSettlementRow(pspRef, amount, status, settledAt));
+                String pspRef = record.get(0).trim();
+                long amount = Long.parseLong(record.get(1).trim());
+                String status = record.get(2).trim();
+                String settledAt = record.get(3).trim();
+                String currency = record.size() == 5 ? record.get(4).trim().toUpperCase() : "INR";
+                if (pspRef.isEmpty() || status.isEmpty() || settledAt.isEmpty() || currency.isEmpty()) {
+                    throw new IllegalArgumentException("Settlement record " + record.getRecordNumber()
+                            + " has an empty required field");
+                }
+                LocalDate rowDate = settlementDate(settledAt);
+                if (!rowDate.equals(settlementDate)) {
+                    throw new IllegalArgumentException("Settlement row date " + rowDate + " does not match requested date " + settlementDate);
+                }
+                if (map.putIfAbsent(pspRef, new PspSettlementRow(pspRef, amount, status, settledAt, currency)) != null) {
+                    throw new IllegalArgumentException("Duplicate PSP reference in settlement file: " + pspRef);
+                }
             }
-        } catch (Exception e) {
+        } catch (IOException | RuntimeException e) {
             throw new IllegalArgumentException("Failed to parse settlement CSV: " + e.getMessage(), e);
         }
         return map;
     }
 
-    private Map<String, InternalPaymentRecord> loadInternalPayments(LocalDate settlementDate) {
+    private LocalDate settlementDate(String value) {
+        try {
+            return LocalDate.parse(value);
+        } catch (java.time.format.DateTimeParseException ignored) {
+            return Instant.parse(value).atZone(ZoneOffset.UTC).toLocalDate();
+        }
+    }
+
+    private Map<String, InternalPaymentRecord> loadInternalPayments(LocalDate settlementDate, java.util.Set<String> csvRefs) {
         Instant startOfDay = settlementDate.atStartOfDay(java.time.ZoneOffset.UTC).toInstant();
         Instant endOfDay = settlementDate.plusDays(1).atStartOfDay(java.time.ZoneOffset.UTC).toInstant();
         List<InternalPaymentRecord> records = jdbcClient.sql("""
@@ -281,26 +308,35 @@ public class ReconciliationService {
                     p.psp_ref,
                     p.status,
                     p.amount,
-                    p.captured_amount,
-                    p.refunded_amount,
+                    p.currency,
+                    COALESCE(SUM(CASE WHEN a.name LIKE 'PSP_RECEIVABLE%' AND a.currency = p.currency AND le.direction = 'DEBIT'
+                                      THEN le.amount WHEN a.name LIKE 'PSP_RECEIVABLE%' AND a.currency = p.currency AND le.direction = 'CREDIT'
+                                      THEN -le.amount ELSE 0 END), 0) AS ledger_settlement_amount,
                     EXISTS (
                         SELECT 1 FROM ledger_transactions lt
                         WHERE lt.payment_id = p.id AND lt.kind = 'CAPTURE'
                     ) AS has_capture_txn
                 FROM payments p
+                LEFT JOIN ledger_transactions lt ON lt.payment_id = p.id
+                    AND lt.created_at >= :startOfDay AND lt.created_at < :endOfDay
+                LEFT JOIN ledger_entries le ON le.txn_id = lt.id
+                LEFT JOIN accounts a ON a.id = le.account_id
                 WHERE p.psp_ref IS NOT NULL
-                  AND p.updated_at >= :startOfDay
-                  AND p.updated_at < :endOfDay
+                  AND (p.psp_ref IN (:csvRefs) OR EXISTS (
+                       SELECT 1 FROM ledger_transactions activity
+                       WHERE activity.payment_id = p.id AND activity.kind IN ('CAPTURE', 'REFUND')
+                         AND activity.created_at >= :startOfDay AND activity.created_at < :endOfDay))
+                GROUP BY p.id, p.psp_ref, p.status, p.amount, p.currency
                 """)
                 .param("startOfDay", Timestamp.from(startOfDay))
                 .param("endOfDay", Timestamp.from(endOfDay))
+                .param("csvRefs", csvRefs.isEmpty() ? List.of("__no_psp_refs__") : csvRefs)
                 .query((rs, rowNum) -> new InternalPaymentRecord(
                         rs.getObject("payment_id", UUID.class),
                         rs.getString("psp_ref"),
                         rs.getString("status"),
-                        rs.getLong("amount"),
-                        rs.getLong("captured_amount"),
-                        rs.getLong("refunded_amount"),
+                        rs.getLong("ledger_settlement_amount"),
+                        rs.getString("currency"),
                         rs.getBoolean("has_capture_txn")))
                 .list();
 
@@ -311,25 +347,19 @@ public class ReconciliationService {
         return byPspRef;
     }
 
-    public record PspSettlementRow(String pspRef, long amount, String status, String settledAt) {}
+    private List<InternalPaymentRecord> loadCapturedPaymentsForDate(LocalDate date) {
+        return new ArrayList<>(loadInternalPayments(date, java.util.Set.of()).values());
+    }
+
+    public record PspSettlementRow(String pspRef, long amount, String status, String settledAt, String currency) {}
 
     public record InternalPaymentRecord(
             UUID paymentId,
             String pspRef,
             String status,
-            long amount,
-            long capturedAmount,
-            long refundedAmount,
+            long expectedSettlementAmount,
+            String currency,
             boolean hasCaptureLedgerTxn) {
-        public long expectedSettlementAmount() {
-            if (("CAPTURED".equalsIgnoreCase(status)
-                            || "PARTIALLY_REFUNDED".equalsIgnoreCase(status)
-                            || "REFUNDED".equalsIgnoreCase(status))
-                    && capturedAmount > 0) {
-                return capturedAmount - refundedAmount;
-            }
-            return amount;
-        }
     }
 
     public record DiscrepancyRecord(

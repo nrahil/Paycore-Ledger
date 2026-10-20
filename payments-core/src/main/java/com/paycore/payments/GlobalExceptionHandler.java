@@ -3,6 +3,8 @@ package com.paycore.payments;
 import com.paycore.common.errors.PayCoreException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.net.URI;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -16,6 +18,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     @ExceptionHandler(PayCoreException.class)
     public ResponseEntity<ProblemDetail> handlePayCoreException(
@@ -48,13 +52,14 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ProblemDetail> handleDataIntegrity(
             DataIntegrityViolationException ex, HttpServletRequest request) {
+        log.warn("Database constraint rejected request {} {}", request.getMethod(), request.getRequestURI(), ex);
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(
-                HttpStatus.UNPROCESSABLE_ENTITY, "Database constraint violation: " + ex.getMostSpecificCause().getMessage());
+                HttpStatus.CONFLICT, "The request conflicts with the current resource state.");
         problem.setType(URI.create("https://paycore.dev/problems/constraint-violation"));
-        problem.setTitle("Database Constraint Violation");
+        problem.setTitle("Request Conflict");
         problem.setInstance(URI.create(request.getRequestURI()));
-        problem.setProperty("errorCode", "DATABASE_CONSTRAINT_VIOLATION");
-        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+        problem.setProperty("errorCode", "REQUEST_CONFLICT");
+        return ResponseEntity.status(HttpStatus.CONFLICT)
                 .contentType(MediaType.APPLICATION_PROBLEM_JSON)
                 .body(problem);
     }

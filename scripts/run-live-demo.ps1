@@ -12,9 +12,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($env:PAYCORE_ADMIN_TOKEN)) {
+    throw "Set PAYCORE_ADMIN_TOKEN in this PowerShell session before running the demo."
+}
+
 Write-Host "==================================================================" -ForegroundColor Cyan
 Write-Host "   PayCore: Live Payment Orchestration & Double-Entry Ledger Demo " -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
+
+$runSuffix = [Guid]::NewGuid().ToString().Substring(0, 8)
 
 if ($StartInfra) {
     Write-Host "`n[0/7] Starting Docker Compose Lite Stack (Postgres 16, Redis 7, Redpanda, Prometheus, Grafana)..." -ForegroundColor Yellow
@@ -25,7 +31,7 @@ if ($StartInfra) {
 Write-Host "`n[1/7] Onboarding Merchant ('Acme Footwear India', 2.00% = 200 bps fee)..." -ForegroundColor Yellow
 $merchantBody = @{
     name       = "Acme Footwear India"
-    email      = "treasury@acmefootwear.in"
+    email      = "treasury+$runSuffix@acmefootwear.in"
     feeBps     = 200
     webhookUrl = "https://example.com/webhooks/paycore"
 } | ConvertTo-Json
@@ -38,7 +44,6 @@ $apiKey = $merchant.apiKey
 Write-Host "  -> Merchant ID : $($merchant.id)" -ForegroundColor Green
 Write-Host "  -> Raw API Key : $apiKey" -ForegroundColor Green
 
-$runSuffix = [Guid]::NewGuid().ToString().Substring(0, 8)
 $createIdemKey = "demo-create-$runSuffix"
 
 Write-Host "`n[2/7] Creating Payment of INR 1,000.00 (100,000 paise) + Testing Idempotent Replay..." -ForegroundColor Yellow
@@ -86,7 +91,7 @@ $refund = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/payments/$paymentId/r
     -Headers @{ "X-API-Key" = $apiKey; "Idempotency-Key" = "demo-ref-$runSuffix" } `
     -ContentType "application/json" `
     -Body $refundBody
-Write-Host "  -> Status       : $($refund.status) | Refunded So Far: $($refund.refundedAmount) paise" -ForegroundColor Green
+Write-Host "  -> Refund       : $($refund.refundAmount) paise | Total Refunded: $($refund.totalRefundedAmount) paise | Fee Reversed: $($refund.feeReversedAmount) paise" -ForegroundColor Green
 
 Write-Host "`n[6/7] Inspecting Double-Entry Ledger Postings for Payment $paymentId..." -ForegroundColor Yellow
 $ledger = Invoke-RestMethod -Method Get -Uri "$BaseUrl/v1/payments/$paymentId/ledger" `
@@ -95,9 +100,14 @@ $ledger | ConvertTo-Json -Depth 6 | Write-Host -ForegroundColor Gray
 
 Write-Host "`n[7/7] Auditing Global Double-Entry Ledger Invariants (/v1/admin/invariants)..." -ForegroundColor Yellow
 $invariants = Invoke-RestMethod -Method Get -Uri "$BaseUrl/v1/admin/invariants" `
-    -Headers @{ "X-API-Key" = $apiKey }
+    -Headers @{ "X-PayCore-Admin-Token" = $env:PAYCORE_ADMIN_TOKEN }
 $invariants | ConvertTo-Json -Depth 5 | Write-Host -ForegroundColor Green
 
+if (-not $invariants.healthy -or $invariants.globalImbalance -ne 0 -or
+    $invariants.unbalancedTransactions -ne 0 -or $invariants.ledgerDrift -ne 0) {
+    throw "Ledger invariant audit failed; inspect the report above before treating this demo as successful."
+}
+
 Write-Host "`n==================================================================" -ForegroundColor Cyan
-Write-Host "   Demo Complete! Global Ledger Drift = $($invariants.globalDriftPaise) paise " -ForegroundColor Cyan
+Write-Host "   Demo Complete! Global Ledger Imbalance = $($invariants.globalImbalance) paise " -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan

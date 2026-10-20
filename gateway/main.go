@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // GatewayConfig holds upstream service URLs and edge protection limits.
@@ -132,6 +142,9 @@ func newReverseProxy(rawURL string, timeout time.Duration) (*httputil.ReversePro
 	if err != nil {
 		return nil, err
 	}
+	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
+		return nil, fmt.Errorf("upstream URL must have an http(s) scheme and host")
+	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
 		ResponseHeaderTimeout: timeout,
@@ -168,9 +181,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Ensure W3C traceparent header exists and propagate to upstream & response
+	// 2. Ensure W3C traceparent header exists and propagate to upstream & response.
+	// The production handler is wrapped by otelhttp, so this injects the active
+	// gateway span. Direct Gateway tests retain a valid standalone trace context.
 	traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
-	if traceparent == "" {
+	if oteltrace.SpanFromContext(r.Context()).SpanContext().IsValid() {
+		otel.GetTextMapPropagator().Inject(r.Context(), propagation.HeaderCarrier(r.Header))
+		traceparent = r.Header.Get("traceparent")
+	} else if traceparent == "" {
 		traceparent = generateTraceparent()
 		r.Header.Set("traceparent", traceparent)
 	}
@@ -233,7 +251,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 7. Route to appropriate backend microservice (CQRS split + domain routing)
 	targetProxy := g.selectUpstreamProxy(r.Method, path)
-	targetProxy.ServeHTTP(w, r)
+	ctx, cancel := context.WithTimeout(r.Context(), g.cfg.UpstreamTimeout)
+	defer cancel()
+	targetProxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (g *Gateway) selectUpstreamProxy(method, path string) *httputil.ReverseProxy {
@@ -351,6 +371,18 @@ func envOrDefault(key, fallback string) string {
 }
 
 func main() {
+	shutdownTracing, err := initTracing()
+	if err != nil {
+		log.Fatalf("Failed to initialize OpenTelemetry tracing: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Printf("Failed to flush OpenTelemetry traces: %v", err)
+		}
+	}()
+
 	rps, _ := strconv.ParseFloat(envOrDefault("RATE_LIMIT_RPS", "200"), 64)
 	burst, _ := strconv.Atoi(envOrDefault("RATE_LIMIT_BURST", "400"))
 
@@ -372,7 +404,34 @@ func main() {
 	}
 
 	log.Printf("PayCore Go Edge Gateway listening on %s", cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, gw); err != nil {
+	handler := otelhttp.NewHandler(gw, "paycore-gateway")
+	server := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Gateway server exited: %v", err)
 	}
+}
+
+func initTracing() (func(context.Context) error, error) {
+	exporter, err := otlptracegrpc.New(context.Background(), otlptracegrpc.WithInsecure())
+	if err != nil {
+		return nil, err
+	}
+	res := resource.NewWithAttributes("", attribute.String("service.name", "paycore-gateway"))
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{},
+	))
+	return provider.Shutdown, nil
 }

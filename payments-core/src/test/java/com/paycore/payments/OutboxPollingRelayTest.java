@@ -28,7 +28,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
  * Verifies Outbox Polling Relay v1 (Section 7.7):
- * - {@code FOR UPDATE SKIP LOCKED} batch claiming
+ * - leased claiming, per-aggregate sequence ordering and crash recovery
  * - Mid-batch broker crash simulation (at-least-once delivery + downstream event_id deduplication)
  */
 @SpringBootTest
@@ -71,7 +71,7 @@ class OutboxPollingRelayTest {
     }
 
     @Test
-    @DisplayName("Outbox Relay v1: Mid-batch broker crash recovers cleanly on retry with zero lost events and idempotent consumer deduplication")
+    @DisplayName("Outbox relay preserves aggregate order and recovers an expired claim after publish-before-ack crash")
     void midBatchCrashRecoversWithZeroLostEvents() throws Exception {
         UUID merchantId = UuidV7.generate();
         UUID paymentId = UuidV7.generate();
@@ -87,31 +87,34 @@ class OutboxPollingRelayTest {
         assertThat(countUnpublished()).isEqualTo(5L);
 
         List<byte[]> brokerReceivedRaw = new ArrayList<>();
-        AtomicBoolean failOnThirdPublish = new AtomicBoolean(true);
+        AtomicBoolean failAfterFirstPublish = new AtomicBoolean(true);
 
         outboxPollingRelay.setCustomPublishSink(row -> brokerReceivedRaw.add(row.payload()));
         outboxPollingRelay.setCrashMidBatchHook(index -> {
-            if (failOnThirdPublish.get() && index == 2) {
-                throw new RuntimeException("Simulated Kafka/Redpanda broker crash mid-batch after event #3");
+            if (failAfterFirstPublish.get() && index == 0) {
+                throw new RuntimeException("Simulated crash after broker publish and before database acknowledgement");
             }
         });
 
-        // First relay poll crashes mid-batch after publishing 3 events -> transaction rolls back published_at updates!
+        // First call publishes seq 1, then simulates a crash before the database acknowledgement.
         assertThatThrownBy(() -> outboxPollingRelay.relayNextBatch())
                 .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Simulated Kafka/Redpanda broker crash");
+                .hasMessageContaining("before database acknowledgement");
 
         // All 5 events remain unpublished in outbox_events so nothing is ever lost
         assertThat(countUnpublished()).isEqualTo(5L);
 
-        // Broker recovers on next poll
-        failOnThirdPublish.set(false);
-        int publishedCount = outboxPollingRelay.relayNextBatch();
+        // Lease prevents duplicate immediate claims; after lease expiry the event is safely retried.
+        assertThat(outboxPollingRelay.relayNextBatch()).isZero();
+        jdbcClient.sql("UPDATE outbox_events SET lease_until = NOW() - INTERVAL '1 second'").update();
+        failAfterFirstPublish.set(false);
+        int publishedCount = 0;
+        for (int i = 0; i < 5; i++) publishedCount += outboxPollingRelay.relayNextBatch();
         assertThat(publishedCount).isEqualTo(5);
         assertThat(countUnpublished()).isEqualTo(0L);
 
-        // Total raw messages sent to broker across both attempts = 3 (before crash) + 5 (after recovery) = 8
-        assertThat(brokerReceivedRaw).hasSize(8);
+        // The first publish is repeated after recovery; sequence ordering is preserved across polls.
+        assertThat(brokerReceivedRaw).hasSize(6);
 
         // Downstream consumer deduplicating by event_id sees exactly the 5 unique events!
         Set<String> deduplicatedEventIds = new LinkedHashSet<>();
@@ -120,6 +123,36 @@ class OutboxPollingRelayTest {
             deduplicatedEventIds.add(ev.getEventId());
         }
         assertThat(deduplicatedEventIds).hasSize(5);
+        List<Long> observedSequences = brokerReceivedRaw.stream()
+                .map(bytes -> {
+                    try { return PaymentEvent.parseFrom(bytes).getEventSeq(); }
+                    catch (Exception e) { throw new AssertionError(e); }
+                }).toList();
+        assertThat(observedSequences).containsExactly(1L, 1L, 2L, 3L, 4L, 5L);
+    }
+
+    @Test
+    @DisplayName("Broker errors release the claim, persist backoff metadata and allow retry")
+    void brokerErrorSchedulesRetryWithoutLosingEvent() {
+        UUID merchantId = UuidV7.generate();
+        UUID paymentId = UuidV7.generate();
+        txTemplate.executeWithoutResult(status -> outboxWriter.writePaymentAuthorized(
+                paymentId, merchantId, 1L, 1_000L, "INR", "psp_retry"));
+
+        outboxPollingRelay.setCustomPublishSink(row -> { throw new RuntimeException("broker unavailable"); });
+        assertThatThrownBy(() -> outboxPollingRelay.relayNextBatch())
+                .isInstanceOf(RuntimeException.class).hasMessageContaining("broker unavailable");
+        assertThat(countUnpublished()).isEqualTo(1L);
+        assertThat(jdbcClient.sql("SELECT attempt_count FROM outbox_events WHERE aggregate_id = :id")
+                .param("id", paymentId).query(Integer.class).single()).isEqualTo(1);
+        assertThat(jdbcClient.sql("SELECT last_error FROM outbox_events WHERE aggregate_id = :id")
+                .param("id", paymentId).query(String.class).single()).contains("broker unavailable");
+
+        jdbcClient.sql("UPDATE outbox_events SET next_attempt_at = NOW() WHERE aggregate_id = :id")
+                .param("id", paymentId).update();
+        outboxPollingRelay.setCustomPublishSink(row -> {});
+        assertThat(outboxPollingRelay.relayNextBatch()).isEqualTo(1);
+        assertThat(countUnpublished()).isZero();
     }
 
     private long countUnpublished() {

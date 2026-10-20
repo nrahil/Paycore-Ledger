@@ -1,6 +1,7 @@
 package com.paycore.reconciliation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.paycore.common.ids.UuidV7;
 import com.paycore.reconciliation.ReconciliationController.ReconciliationRequest;
@@ -41,6 +42,7 @@ class ReconciliationIntegrationTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("paycore.security.admin-token", () -> "reconciliation-test-admin");
     }
 
     @Autowired
@@ -48,6 +50,9 @@ class ReconciliationIntegrationTest {
 
     @Autowired
     private TestRestTemplate restTemplate;
+
+    @Autowired
+    private ReconciliationService reconciliationService;
 
     @BeforeEach
     void setUp() {
@@ -57,6 +62,7 @@ class ReconciliationIntegrationTest {
                     psp_ref TEXT,
                     status TEXT NOT NULL,
                     amount BIGINT NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'INR',
                     captured_amount BIGINT NOT NULL DEFAULT 0,
                     refunded_amount BIGINT NOT NULL DEFAULT 0,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT '2026-10-11T10:00:00Z'
@@ -64,10 +70,28 @@ class ReconciliationIntegrationTest {
                 CREATE TABLE IF NOT EXISTS ledger_transactions (
                     id UUID PRIMARY KEY,
                     payment_id UUID NOT NULL,
-                    kind TEXT NOT NULL
+                    kind TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT '2026-10-11T10:00:00Z'
+                );
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id UUID PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ledger_entries (
+                    id UUID PRIMARY KEY,
+                    txn_id UUID NOT NULL,
+                    account_id UUID NOT NULL,
+                    direction TEXT NOT NULL,
+                    amount BIGINT NOT NULL
                 );
                 """).update();
-        jdbcClient.sql("TRUNCATE TABLE recon_discrepancies, recon_runs, ledger_transactions, payments").update();
+        jdbcClient.sql("TRUNCATE TABLE recon_discrepancies, recon_runs, ledger_entries, ledger_transactions, payments, accounts").update();
+        jdbcClient.sql("INSERT INTO accounts (id, type, currency, name) VALUES (:id, 'ASSET', 'INR', 'PSP_RECEIVABLE_00')")
+                .param("id", UUID.fromString("00000000-0000-7000-8000-000000000001")).update();
+        jdbcClient.sql("INSERT INTO accounts (id, type, currency, name) VALUES (:id, 'LIABILITY', 'INR', 'MERCHANT_PAYABLE')")
+                .param("id", UUID.fromString("00000000-0000-7000-8000-000000000002")).update();
     }
 
     @Test
@@ -88,18 +112,22 @@ class ReconciliationIntegrationTest {
         UUID statusMismatchId = insertPaymentWithLedger("psp_status_diff", "FAILED", 15_000L, 0L, 0L, false);
 
         String csv = """
-                psp_ref,amount,status,settled_at
-                psp_match_1,10000,SETTLED,2026-10-11T10:00:00Z
-                psp_match_2,20000,SETTLED,2026-10-11T10:05:00Z
-                psp_match_3,50000,SETTLED,2026-10-11T10:10:00Z
-                psp_ghost_in_csv,8800,SETTLED,2026-10-11T10:15:00Z
-                psp_amount_diff,19500,SETTLED,2026-10-11T10:20:00Z
-                psp_status_diff,15000,AUTHORIZED,2026-10-11T10:25:00Z
+                psp_ref,amount,status,settled_at,currency
+                psp_match_1,10000,SETTLED,2026-10-11T10:00:00Z,INR
+                psp_match_2,20000,SETTLED,2026-10-11T10:05:00Z,INR
+                psp_match_3,50000,SETTLED,2026-10-11T10:10:00Z,INR
+                psp_ghost_in_csv,8800,SETTLED,2026-10-11T10:15:00Z,INR
+                psp_amount_diff,19500,SETTLED,2026-10-11T10:20:00Z,INR
+                psp_status_diff,15000,AUTHORIZED,2026-10-11T10:25:00Z,INR
                 """;
 
         ReconciliationRequest req = new ReconciliationRequest(LocalDate.of(2026, 10, 11), csv);
-        ResponseEntity<ReconRunReport> resp =
-                restTemplate.postForEntity("/v1/admin/reconciliation", req, ReconRunReport.class);
+        org.springframework.http.HttpHeaders adminHeaders = new org.springframework.http.HttpHeaders();
+        adminHeaders.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        adminHeaders.set("X-PayCore-Admin-Token", "reconciliation-test-admin");
+        ResponseEntity<ReconRunReport> resp = restTemplate.exchange(
+                "/v1/admin/reconciliation", org.springframework.http.HttpMethod.POST,
+                new org.springframework.http.HttpEntity<>(req, adminHeaders), ReconRunReport.class);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         ReconRunReport report = resp.getBody();
@@ -140,6 +168,71 @@ class ReconciliationIntegrationTest {
         assertThat(statusMismatch.paymentId()).isEqualTo(statusMismatchId);
     }
 
+    @Test
+    @DisplayName("Reconciliation compares ledger receivable by currency and rejects duplicate or wrong-date rows")
+    void ledgerCurrencyAndSettlementFileValidation() {
+        UUID paymentId = insertPaymentWithLedger("psp_currency", "CAPTURED", 3_000L, 3_000L, 0L, true);
+        jdbcClient.sql("UPDATE payments SET currency = 'USD' WHERE id = :id").param("id", paymentId).update();
+
+        ReconRunReport report = reconciliationService.runReconciliation(LocalDate.of(2026, 10, 11), """
+                psp_ref,amount,status,settled_at,currency
+                psp_currency,3000,SETTLED,2026-10-11T10:00:00Z,INR
+                """);
+        assertThat(report.discrepancies()).singleElement()
+                .satisfies(d -> assertThat(d.kind()).isEqualTo(DiscrepancyKind.CURRENCY_MISMATCH));
+
+        assertThatThrownBy(() -> reconciliationService.runReconciliation(LocalDate.of(2026, 10, 11), """
+                psp_ref,amount,status,settled_at
+                psp_currency,3000,SETTLED,2026-10-11T10:00:00Z
+                psp_currency,3000,SETTLED,2026-10-11T10:00:00Z
+                """))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Duplicate PSP reference");
+
+        assertThatThrownBy(() -> reconciliationService.runReconciliation(LocalDate.of(2026, 10, 11), """
+                psp_ref,amount,status,settled_at
+                psp_currency,3000,SETTLED,2026-10-12T00:00:00Z
+                """))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("does not match requested date");
+    }
+
+    @Test
+    @DisplayName("Settlement CSV honors quoted fields containing commas")
+    void settlementCsvParsesQuotedCommaInPspReference() {
+        ReconRunReport report = reconciliationService.runReconciliation(LocalDate.of(2026, 10, 11), """
+                psp_ref,amount,status,settled_at,currency
+                "psp,ghost",3000,SETTLED,2026-10-11T10:00:00Z,INR
+                """);
+
+        assertThat(report.discrepancies()).singleElement().satisfies(discrepancy -> {
+            assertThat(discrepancy.kind()).isEqualTo(DiscrepancyKind.MISSING_IN_LEDGER);
+            assertThat(discrepancy.pspRef()).isEqualTo("psp,ghost");
+        });
+    }
+
+    @Test
+    @DisplayName("Daily reconciliation matches capture and later refund movements on their own dates")
+    void captureAndRefundAreReconciledOnTheirLedgerDates() {
+        UUID paymentId = insertPaymentWithLedger("psp_cross_day", "PARTIALLY_REFUNDED", 25_000L, 25_000L, 0L, true);
+        UUID refundTxnId = UuidV7.generate();
+        jdbcClient.sql("INSERT INTO ledger_transactions (id, payment_id, kind, created_at) VALUES (:id, :paymentId, 'REFUND', '2026-10-12T02:00:00Z')")
+                .param("id", refundTxnId).param("paymentId", paymentId).update();
+        addReceivableEntry(refundTxnId, "CREDIT", 5_000L);
+
+        ReconRunReport captureDay = reconciliationService.runReconciliation(LocalDate.of(2026, 10, 11), """
+                psp_ref,amount,status,settled_at,currency
+                psp_cross_day,25000,SETTLED,2026-10-11T10:00:00Z,INR
+                """);
+        assertThat(captureDay.matched()).isEqualTo(1);
+        assertThat(captureDay.discrepancies()).isEmpty();
+
+        ReconRunReport refundDay = reconciliationService.runReconciliation(LocalDate.of(2026, 10, 12), """
+                psp_ref,amount,status,settled_at,currency
+                psp_cross_day,-5000,SETTLED,2026-10-12T02:00:00Z,INR
+                """);
+        assertThat(refundDay.matched()).isEqualTo(1);
+        assertThat(refundDay.discrepancies()).isEmpty();
+    }
+
     private UUID insertPaymentWithLedger(
             String pspRef, String status, long amount, long capturedAmount, long refundedAmount, boolean withCaptureLedgerTxn) {
         UUID paymentId = UuidV7.generate();
@@ -156,14 +249,34 @@ class ReconciliationIntegrationTest {
                 .update();
 
         if (withCaptureLedgerTxn) {
+            UUID captureTxnId = UuidV7.generate();
             jdbcClient.sql("""
-                    INSERT INTO ledger_transactions (id, payment_id, kind)
-                    VALUES (:id, :paymentId, 'CAPTURE')
+                    INSERT INTO ledger_transactions (id, payment_id, kind, created_at)
+                    VALUES (:id, :paymentId, 'CAPTURE', '2026-10-11T10:00:00Z')
                     """)
-                    .param("id", UuidV7.generate())
+                    .param("id", captureTxnId)
                     .param("paymentId", paymentId)
                     .update();
+            addReceivableEntry(captureTxnId, "DEBIT", capturedAmount);
+            if (refundedAmount > 0) {
+                UUID refundTxnId = UuidV7.generate();
+                jdbcClient.sql("INSERT INTO ledger_transactions (id, payment_id, kind, created_at) VALUES (:id, :paymentId, 'REFUND', '2026-10-11T10:01:00Z')")
+                        .param("id", refundTxnId).param("paymentId", paymentId).update();
+                addReceivableEntry(refundTxnId, "CREDIT", refundedAmount);
+            }
         }
         return paymentId;
+    }
+
+    private void addReceivableEntry(UUID txnId, String direction, long amount) {
+        if (amount == 0) return;
+        for (var posting : java.util.List.of(
+                Map.entry(UUID.fromString("00000000-0000-7000-8000-000000000001"), direction),
+                Map.entry(UUID.fromString("00000000-0000-7000-8000-000000000002"), "DEBIT".equals(direction) ? "CREDIT" : "DEBIT"))) {
+            jdbcClient.sql("INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount) VALUES (:id, :txnId, :accountId, :direction, :amount)")
+                    .param("id", UuidV7.generate()).param("txnId", txnId)
+                    .param("accountId", posting.getKey()).param("direction", posting.getValue())
+                    .param("amount", amount).update();
+        }
     }
 }

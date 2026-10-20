@@ -71,6 +71,7 @@ class StretchAbBenchmarkTest {
         registry.add("paycore.redis.enabled", () -> "false");
         registry.add("paycore.outbox.relay-enabled", () -> "false");
         registry.add("paycore.resolver.interval-ms", () -> "3600000");
+        registry.add("paycore.security.admin-token", () -> "payments-test-admin");
         registry.add("management.endpoints.web.exposure.include", () -> "health,info,prometheus,metrics");
     }
 
@@ -95,7 +96,7 @@ class StretchAbBenchmarkTest {
     @DisplayName("1. Phase 6 Observability & OpenAPI 3.1 Contract Verification")
     void prometheusMetricsAndOpenApiContractVerified() throws Exception {
         // Trigger invariant check so drift gauge is updated
-        ResponseEntity<String> invResp = restTemplate.getForEntity("/v1/admin/invariants", String.class);
+        ResponseEntity<String> invResp = getAdmin("/v1/admin/invariants", String.class);
         assertThat(invResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         ResponseEntity<String> promResp = restTemplate.getForEntity("/actuator/prometheus", String.class);
@@ -132,12 +133,12 @@ class StretchAbBenchmarkTest {
         }
 
         // --- A: Baseline (Unsharded: sharded=false) ---
-        restTemplate.postForEntity("/v1/admin/ledger/sharding?enabled=false", null, String.class);
+        postAdmin("/v1/admin/ledger/sharding?enabled=false");
         List<PaymentTarget> unshardedTargets = prepareAuthorizedPayments(concurrency, apiKeys);
         BenchmarkStats unshardedStats = runConcurrentCaptures(unshardedTargets);
 
         // --- B: Treatment (16-Way Sharded: sharded=true) ---
-        restTemplate.postForEntity("/v1/admin/ledger/sharding?enabled=true", null, String.class);
+        postAdmin("/v1/admin/ledger/sharding?enabled=true");
         List<PaymentTarget> shardedTargets = prepareAuthorizedPayments(concurrency, apiKeys);
         BenchmarkStats shardedStats = runConcurrentCaptures(shardedTargets);
 
@@ -153,21 +154,33 @@ class StretchAbBenchmarkTest {
 
         // Verify system balances & shard distribution
         ResponseEntity<String> sysBalResp =
-                restTemplate.getForEntity("/v1/admin/ledger/system-balances", String.class);
+                getAdmin("/v1/admin/ledger/system-balances", String.class);
         assertThat(sysBalResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode sysBal = objectMapper.readTree(sysBalResp.getBody());
         assertThat(sysBal.get("shardedModeEnabled").asBoolean()).isTrue();
         assertThat(sysBal.get("activeFeeShardsPopulated").asLong()).isGreaterThan(4L);
 
         // Verify ledger invariants remain 100% healthy (drift == 0) across both unsharded and sharded runs
-        ResponseEntity<String> invResp = restTemplate.getForEntity("/v1/admin/invariants", String.class);
+        ResponseEntity<String> invResp = getAdmin("/v1/admin/invariants", String.class);
         assertThat(invResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode invJson = objectMapper.readTree(invResp.getBody());
         assertThat(invJson.get("status").asText()).isEqualTo("PASS");
         assertThat(invJson.get("ledgerDrift").asLong()).isZero();
 
         // Reset sharding flag back to default
-        restTemplate.postForEntity("/v1/admin/ledger/sharding?enabled=false", null, String.class);
+        postAdmin("/v1/admin/ledger/sharding?enabled=false");
+    }
+
+    private ResponseEntity<String> getAdmin(String path, Class<String> responseType) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-PayCore-Admin-Token", "payments-test-admin");
+        return restTemplate.exchange(path, HttpMethod.GET, new HttpEntity<>(headers), responseType);
+    }
+
+    private ResponseEntity<String> postAdmin(String path) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-PayCore-Admin-Token", "payments-test-admin");
+        return restTemplate.exchange(path, HttpMethod.POST, new HttpEntity<>(null, headers), String.class);
     }
 
     @Test

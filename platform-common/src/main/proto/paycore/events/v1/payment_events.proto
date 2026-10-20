@@ -51,6 +51,7 @@ message RefundProcessed {
   int64 total_refunded_amount = 3;
   string currency = 4;
   string ledger_txn_id = 5;
+  int64 fee_reversed_amount = 6;
 }
 
 message PayoutCreated {

@@ -38,7 +38,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"paycore.resolver.interval-ms=3600000"})
+        properties = {"paycore.resolver.interval-ms=3600000", "paycore.security.admin-token=payments-test-admin"})
 @Testcontainers
 class PaymentsCoreIntegrationTest {
 
@@ -107,6 +107,9 @@ class PaymentsCoreIntegrationTest {
         ResponseEntity<JsonNode> unauth = restTemplate.getForEntity("/v1/merchants/me/balance", JsonNode.class);
         assertThat(unauth.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         assertThat(unauth.getBody().get("errorCode").asText()).isEqualTo("UNAUTHORIZED_MERCHANT");
+
+        ResponseEntity<String> unauthAdmin = restTemplate.getForEntity("/v1/admin/invariants", String.class);
+        assertThat(unauthAdmin.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
@@ -150,7 +153,7 @@ class PaymentsCoreIntegrationTest {
         // 4. Verify merchant balance == 980 paise
         assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(980L);
 
-        // 5. Partial refund #1 of 400 paise (fee not returned policy -> merchant payable 980 - 400 = 580)
+        // 5. Partial refund #1 of 400 paise reverses 8 paise of the 20-paise capture fee.
         ResponseEntity<PaymentService.RefundResponse> refund1 = postWithKey(
                 merchant.apiKey(),
                 "idem-ref-1",
@@ -159,9 +162,10 @@ class PaymentsCoreIntegrationTest {
                 PaymentService.RefundResponse.class);
         assertThat(refund1.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(refund1.getBody().totalRefundedAmount()).isEqualTo(400L);
-        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(580L);
+        assertThat(refund1.getBody().feeReversedAmount()).isEqualTo(8L);
+        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(588L);
 
-        // 6. Partial refund #2 of 300 paise (total refunded = 700, merchant payable = 280)
+        // 6. Partial refund #2 of 300 paise reverses the cumulative fee to 14 paise.
         ResponseEntity<PaymentService.RefundResponse> refund2 = postWithKey(
                 merchant.apiKey(),
                 "idem-ref-2",
@@ -170,7 +174,8 @@ class PaymentsCoreIntegrationTest {
                 PaymentService.RefundResponse.class);
         assertThat(refund2.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(refund2.getBody().totalRefundedAmount()).isEqualTo(700L);
-        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(280L);
+        assertThat(refund2.getBody().feeReversedAmount()).isEqualTo(6L);
+        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(294L);
 
         ResponseEntity<Payment> afterPartialRefunds = getWithKey(
                 merchant.apiKey(), "/v1/payments/" + created.id(), Payment.class);
@@ -186,7 +191,7 @@ class PaymentsCoreIntegrationTest {
         assertThat(overRefund.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
         assertThat(overRefund.getBody().get("errorCode").asText()).isEqualTo("REFUND_EXCEEDS_CAPTURED_AMOUNT");
 
-        // 8. Payout of 200 paise (merchant payable 280 - 200 = 80)
+        // 8. Payout of 200 paise (merchant payable 294 - 200 = 94)
         ResponseEntity<PaymentService.PayoutResponse> payoutResp = postWithKey(
                 merchant.apiKey(),
                 "idem-payout-1",
@@ -194,13 +199,18 @@ class PaymentsCoreIntegrationTest {
                 new PaymentService.PayoutRequest(200L, "INR"),
                 PaymentService.PayoutResponse.class);
         assertThat(payoutResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(80L);
+        assertThat(fetchMerchantBalance(merchant.apiKey())).isEqualTo(94L);
 
-        // 9. Verify ledger entries for payment (3 capture entries + 2 refund1 entries + 2 refund2 entries = 7 entries)
+        // 9. Verify ledger entries (3 capture entries + 3 entries per refund, including fee revenue reversal).
         ResponseEntity<JsonNode> ledgerEntriesResp = getWithKey(
                 merchant.apiKey(), "/v1/payments/" + created.id() + "/ledger", JsonNode.class);
         assertThat(ledgerEntriesResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(ledgerEntriesResp.getBody().size()).isEqualTo(7);
+        assertThat(ledgerEntriesResp.getBody().size()).isEqualTo(9);
+        MerchantService.CreatedMerchantResponse unrelatedMerchant = onboardMerchant("OtherTenant", 200);
+        ResponseEntity<JsonNode> crossTenantLedger = getWithKey(
+                unrelatedMerchant.apiKey(), "/v1/payments/" + created.id() + "/ledger", JsonNode.class);
+        assertThat(crossTenantLedger.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(crossTenantLedger.getBody()).isEmpty();
 
         // 10. Verify outbox_events contain valid Protobuf PaymentEvent payloads with gapless event_seq 1..4
         List<byte[]> payloads = jdbcClient.sql("""
@@ -226,6 +236,44 @@ class PaymentsCoreIntegrationTest {
         assertThat(ev4.getEventType()).isEqualTo("refund.processed");
 
         // 11. Run Invariant Checker (/v1/admin/invariants) -> must report PASS and 0 drift
+        assertInvariantsHealthy();
+    }
+
+    @Test
+    void captureAndFullRefundRecoverWithStableOperationIdsAndReverseEntireFee() {
+        MerchantService.CreatedMerchantResponse merchant = onboardMerchant("OperationRecoveryMerchant", 200);
+        Payment created = paymentService.createPayment(
+                merchant.id(), new PaymentService.CreatePaymentRequest(1000L, "INR", Map.of()));
+        Payment payment = paymentService.authorizePayment(merchant.id(), created.id());
+
+        paymentService.setCrashHook(stage -> {
+            if ("AFTER_PSP_BEFORE_TX2".equals(stage)) throw new RuntimeException("simulated process crash");
+        });
+        assertThatThrownBy(() -> paymentService.capturePayment(merchant.id(), payment.id(), merchant.feeBps()))
+                .isInstanceOf(RuntimeException.class);
+        paymentService.setCrashHook(stage -> {});
+        assertThat(paymentService.getPayment(merchant.id(), payment.id()).status()).isEqualTo(PaymentStatus.CAPTURING);
+        assertThat(paymentService.resolveStuckCaptureRefundOperations(Duration.ZERO)).isEqualTo(1);
+        assertThat(paymentService.getPayment(merchant.id(), payment.id()).status()).isEqualTo(PaymentStatus.CAPTURED);
+
+        paymentService.setCrashHook(stage -> {
+            if ("AFTER_PSP_BEFORE_TX2".equals(stage)) throw new RuntimeException("simulated process crash");
+        });
+        assertThatThrownBy(() -> paymentService.refundPayment(
+                        merchant.id(), payment.id(), new PaymentService.RefundRequest(1000L, "full-refund")))
+                .isInstanceOf(RuntimeException.class);
+        paymentService.setCrashHook(stage -> {});
+        assertThat(paymentService.resolveStuckCaptureRefundOperations(Duration.ZERO)).isEqualTo(1);
+
+        Payment refunded = paymentService.getPayment(merchant.id(), payment.id());
+        assertThat(refunded.status()).isEqualTo(PaymentStatus.REFUNDED);
+        assertThat(refunded.refundedAmount()).isEqualTo(1000L);
+        assertThat(fetchMerchantBalance(merchant.apiKey())).isZero();
+        assertThat(jdbcClient.sql("""
+                SELECT fee_amount FROM payment_operations
+                WHERE payment_id = :paymentId AND operation_type = 'REFUND' AND status = 'COMPLETED'
+                """)
+                .param("paymentId", payment.id()).query(Long.class).single()).isEqualTo(20L);
         assertInvariantsHealthy();
     }
 
@@ -354,7 +402,10 @@ class PaymentsCoreIntegrationTest {
     }
 
     private void assertInvariantsHealthy() {
-        ResponseEntity<JsonNode> inv = restTemplate.getForEntity("/v1/admin/invariants", JsonNode.class);
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-PayCore-Admin-Token", "payments-test-admin");
+        ResponseEntity<JsonNode> inv = restTemplate.exchange(
+                "/v1/admin/invariants", HttpMethod.GET, new HttpEntity<>(headers), JsonNode.class);
         assertThat(inv.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode body = inv.getBody();
         assertThat(body.get("status").asText()).isEqualTo("PASS");

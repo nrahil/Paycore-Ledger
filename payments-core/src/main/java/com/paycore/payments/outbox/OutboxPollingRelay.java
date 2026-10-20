@@ -23,8 +23,8 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Isolation;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Outbox Relay v1: Polling with {@code FOR UPDATE SKIP LOCKED} (Section 4.2 #5, 5.1, 6.2, 7.7).
@@ -47,6 +47,8 @@ public class OutboxPollingRelay {
     private final ClockProvider clockProvider;
     private final boolean relayEnabled;
     private final int batchSize;
+    private final TransactionTemplate transactionTemplate;
+    private final int leaseSeconds;
 
     private volatile Consumer<Integer> crashMidBatchHook = index -> {};
     private volatile Consumer<OutboxRow> customPublishSink;
@@ -56,14 +58,18 @@ public class OutboxPollingRelay {
             @Autowired(required = false) KafkaTemplate<String, byte[]> kafkaTemplate,
             ObjectMapper objectMapper,
             ClockProvider clockProvider,
+            PlatformTransactionManager transactionManager,
             @Value("${paycore.outbox.relay-enabled:false}") boolean relayEnabled,
-            @Value("${paycore.outbox.batch-size:100}") int batchSize) {
+            @Value("${paycore.outbox.batch-size:100}") int batchSize,
+            @Value("${paycore.outbox.lease-seconds:30}") int leaseSeconds) {
         this.jdbcClient = jdbcClient;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
         this.clockProvider = clockProvider;
         this.relayEnabled = relayEnabled;
         this.batchSize = batchSize;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.leaseSeconds = Math.max(1, leaseSeconds);
     }
 
     @Scheduled(fixedDelayString = "${paycore.outbox.poll-interval-ms:250}")
@@ -79,22 +85,41 @@ public class OutboxPollingRelay {
     }
 
     /**
-     * Claims up to {@code batchSize} unpublished outbox rows with {@code FOR UPDATE SKIP LOCKED},
+     * Claims a batch in a short transaction, publishes outside the transaction, then acknowledges each row.
      * publishes each to Redpanda/Kafka keyed by {@code aggregate_id} ({@code payment_id}),
      * and marks {@code published_at}.
      */
-    @Transactional(isolation = Isolation.READ_COMMITTED)
     public int relayNextBatch() {
-        List<OutboxRow> rows = jdbcClient.sql("""
-                SELECT id, aggregate_id, event_seq, event_type, schema_version,
-                       payload, trace_context::text AS trace_json, created_at
-                FROM outbox_events
-                WHERE published_at IS NULL
-                ORDER BY created_at ASC, id ASC
-                LIMIT :batchSize
-                FOR UPDATE SKIP LOCKED
-                """)
+        UUID claimToken = UUID.randomUUID();
+        List<OutboxRow> rows = transactionTemplate.execute(status -> jdbcClient.sql("""
+                        WITH candidates AS (
+                            SELECT current.id, current.created_at
+                            FROM outbox_events current
+                            WHERE current.published_at IS NULL
+                              AND current.next_attempt_at <= NOW()
+                              AND (current.lease_until IS NULL OR current.lease_until <= NOW())
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM outbox_events previous
+                                  WHERE previous.aggregate_id = current.aggregate_id
+                                    AND previous.event_seq < current.event_seq
+                                    AND previous.published_at IS NULL
+                              )
+                            ORDER BY current.created_at, current.id
+                            LIMIT :batchSize
+                            FOR UPDATE OF current SKIP LOCKED
+                        )
+                        UPDATE outbox_events target
+                        SET claim_token = :claimToken,
+                            lease_until = NOW() + (:leaseSeconds * INTERVAL '1 second')
+                        FROM candidates
+                        WHERE target.id = candidates.id AND target.created_at = candidates.created_at
+                        RETURNING target.id, target.aggregate_id, target.event_seq, target.event_type,
+                                  target.schema_version, target.payload,
+                                  target.trace_context::text AS trace_json, target.created_at
+                        """)
                 .param("batchSize", batchSize)
+                .param("claimToken", claimToken)
+                .param("leaseSeconds", leaseSeconds)
                 .query((rs, rowNum) -> new OutboxRow(
                         rs.getObject("id", UUID.class),
                         rs.getObject("aggregate_id", UUID.class),
@@ -104,34 +129,65 @@ public class OutboxPollingRelay {
                         rs.getBytes("payload"),
                         parseTraceContext(rs.getString("trace_json")),
                         rs.getTimestamp("created_at").toInstant()))
-                .list();
+                .list());
 
         if (rows.isEmpty()) {
             return 0;
         }
 
         int publishedCount = 0;
-        Timestamp nowTs = Timestamp.from(clockProvider.now());
-
         for (int i = 0; i < rows.size(); i++) {
             OutboxRow row = rows.get(i);
-            publishToBus(row);
+            try {
+                publishToBus(row);
+            } catch (RuntimeException failure) {
+                // An expired lease recovers process crashes; ordinary broker errors are released immediately.
+                jdbcClient.sql("""
+                        UPDATE outbox_events
+                        SET claim_token = NULL, lease_until = NULL,
+                            attempt_count = attempt_count + 1,
+                            next_attempt_at = NOW() + (LEAST(300, POWER(2, LEAST(attempt_count, 8))) * INTERVAL '1 second'),
+                            last_error = :error
+                        WHERE id = :id AND created_at = :createdAt AND claim_token = :claimToken
+                        """)
+                        .param("error", truncate(failure.getMessage(), 2000))
+                        .param("id", row.id())
+                        .param("createdAt", Timestamp.from(row.createdAt()))
+                        .param("claimToken", claimToken)
+                        .update();
+                releaseUnprocessed(rows.subList(i + 1, rows.size()), claimToken);
+                throw failure;
+            }
+            // This hook deliberately runs after the external publish but before acknowledgement to model a hard crash.
             crashMidBatchHook.accept(i);
 
-            jdbcClient.sql("""
+            int acknowledged = jdbcClient.sql("""
                     UPDATE outbox_events
-                    SET published_at = :publishedAt
-                    WHERE id = :id AND created_at = :createdAt
+                    SET published_at = :publishedAt, claim_token = NULL, lease_until = NULL, last_error = NULL
+                    WHERE id = :id AND created_at = :createdAt AND claim_token = :claimToken
                     """)
-                    .param("publishedAt", nowTs)
+                    .param("publishedAt", Timestamp.from(clockProvider.now()))
                     .param("id", row.id())
                     .param("createdAt", Timestamp.from(row.createdAt()))
+                    .param("claimToken", claimToken)
                     .update();
-
-            publishedCount++;
+            if (acknowledged == 1) publishedCount++;
         }
 
         return publishedCount;
+    }
+
+    private void releaseUnprocessed(List<OutboxRow> rows, UUID claimToken) {
+        for (OutboxRow row : rows) {
+            jdbcClient.sql("UPDATE outbox_events SET claim_token = NULL, lease_until = NULL WHERE id = :id AND created_at = :createdAt AND claim_token = :claimToken")
+                    .param("id", row.id()).param("createdAt", Timestamp.from(row.createdAt()))
+                    .param("claimToken", claimToken).update();
+        }
+    }
+
+    private String truncate(String value, int maxLength) {
+        if (value == null) return "Unknown Kafka publish error";
+        return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
     private void publishToBus(OutboxRow row) {

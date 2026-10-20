@@ -35,40 +35,48 @@
     },
     {
       "id": 3,
-      "title": "Payment State Transitions / sec",
+      "title": "Payment API Requests / sec",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "sum by (from, to) (rate(paycore_payment_transitions_total[1m]))",
-          "legendFormat": "{{from}} -> {{to}}"
+          "expr": "sum by (uri, status) (rate(http_server_requests_seconds_count{job=\"payments-core\",uri=~\"/v1/payments.*\"}[1m]))",
+          "legendFormat": "{{uri}} ({{status}})"
         }
       ],
       "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 }
     },
     {
       "id": 4,
-      "title": "HTTP Endpoint Latency (p50 / p95 / p99)",
+      "title": "Payment API Latency (p50 / p95 / p99)",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket[1m])))",
-          "legendFormat": "p99 {{uri}}"
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{job=\"payments-core\",uri=~\"/v1/payments.*\"}[1m])))",
+          "legendFormat": "p99"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket[1m])))",
-          "legendFormat": "p95 {{uri}}"
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{job=\"payments-core\",uri=~\"/v1/payments.*\"}[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_server_requests_seconds_bucket{job=\"payments-core\",uri=~\"/v1/payments.*\"}[1m])))",
+          "legendFormat": "p50"
         }
       ],
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 }
     },
     {
       "id": 5,
-      "title": "Idempotency Decisions by Source (Redis Fast-Path vs Postgres)",
+      "title": "Gateway Requests and Rate Limits / sec",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "sum by (result, source) (rate(paycore_idempotency_decisions_total[1m]))",
-          "legendFormat": "{{source}}: {{result}}"
+          "expr": "rate(paycore_gateway_requests_total[1m])",
+          "legendFormat": "Gateway requests"
+        },
+        {
+          "expr": "rate(paycore_gateway_rate_limited_total[1m])",
+          "legendFormat": "Rate limited"
         }
       ],
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 }

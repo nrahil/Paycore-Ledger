@@ -13,6 +13,7 @@ public enum PaymentStatus {
     CREATED,
     AUTHORIZING,
     AUTHORIZED,
+    CAPTURING,
     CAPTURED,
     PARTIALLY_REFUNDED,
     REFUNDED,
@@ -22,7 +23,8 @@ public enum PaymentStatus {
     private static final Map<PaymentStatus, Set<PaymentStatus>> ALLOWED_TRANSITIONS = Map.of(
             CREATED, EnumSet.of(AUTHORIZING),
             AUTHORIZING, EnumSet.of(AUTHORIZED, FAILED),
-            AUTHORIZED, EnumSet.of(CAPTURED, VOIDED),
+            AUTHORIZED, EnumSet.of(CAPTURING, CAPTURED, VOIDED),
+            CAPTURING, EnumSet.of(CAPTURED, AUTHORIZED),
             CAPTURED, EnumSet.of(PARTIALLY_REFUNDED, REFUNDED),
             PARTIALLY_REFUNDED, EnumSet.of(PARTIALLY_REFUNDED, REFUNDED),
             REFUNDED, EnumSet.noneOf(PaymentStatus.class),

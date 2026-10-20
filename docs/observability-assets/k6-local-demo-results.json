@@ -1,0 +1,38 @@
+{
+  "scenario": "local_payment_flow",
+  "capturedAt": "2026-10-20",
+  "executor": "constant-vus",
+  "virtualUsers": 2,
+  "durationSeconds": 30,
+  "completedPaymentFlows": 180,
+  "httpRequests": 540,
+  "checks": {
+    "passed": 540,
+    "failed": 0,
+    "threshold": "rate > 0.95",
+    "result": "passed"
+  },
+  "httpRequestFailures": 0,
+  "captureRequestLatencyMs": {
+    "p95": 274.56,
+    "threshold": "p95 < 2000 ms",
+    "result": "passed"
+  },
+  "prometheusTargetsUp": [
+    "gateway",
+    "mock-psp",
+    "payments-core",
+    "read-model-service",
+    "reconciliation",
+    "webhook-service"
+  ],
+  "jaegerServicesObserved": [
+    "paycore-gateway",
+    "payments-core",
+    "mock-psp",
+    "read-model-service",
+    "reconciliation",
+    "webhook-service"
+  ],
+  "scope": "Local functional/load smoke test; not a production capacity benchmark."
+}

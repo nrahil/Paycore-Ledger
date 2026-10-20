@@ -22,23 +22,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.HttpStatusCodeException;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestTemplate;
 
 /**
  * Webhook Delivery Engine with HMAC-SHA256 signing, SSRF protection, idempotent {@code processed_events}
- * deduplication, delay-aware retry topics (1m, 5m, 30m, 2h, 6h) with jitter, and DLQ + replay (Section 5.4 & 7.8).
+ * deduplication, database-backed scheduled retries (1m, 5m, 30m, 2h, 6h) with jitter, and DLQ + replay.
  */
 @Service
 public class WebhookDeliveryService {
@@ -64,8 +61,10 @@ public class WebhookDeliveryService {
     private final ObjectMapper objectMapper;
     private final ClockProvider clockProvider;
     private final KafkaTemplate<String, byte[]> kafkaTemplate;
-    private final RestTemplate restTemplate;
+    private final WebhookHttpSender httpSender;
     private final boolean kafkaEnabled;
+    private final TransactionTemplate transactionTemplate;
+    private final int deliveryLeaseSeconds;
     private volatile boolean allowLocalInTest;
 
     public WebhookDeliveryService(
@@ -75,36 +74,36 @@ public class WebhookDeliveryService {
             @Autowired(required = false) KafkaTemplate<String, byte[]> kafkaTemplate,
             @Value("${paycore.webhook.kafka-listener-enabled:false}") boolean kafkaEnabled,
             @Value("${paycore.webhook.allow-local-targets:false}") boolean allowLocalInTest,
-            @Value("${paycore.webhook.http-timeout-ms:2000}") int timeoutMs) {
+            @Value("${paycore.webhook.http-timeout-ms:2000}") int timeoutMs,
+            PlatformTransactionManager transactionManager,
+            @Value("${paycore.webhook.delivery-lease-seconds:30}") int deliveryLeaseSeconds) {
         this.jdbcClient = jdbcClient;
         this.objectMapper = objectMapper;
         this.clockProvider = clockProvider;
         this.kafkaTemplate = kafkaTemplate;
         this.kafkaEnabled = kafkaEnabled;
         this.allowLocalInTest = allowLocalInTest;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.deliveryLeaseSeconds = Math.max(1, deliveryLeaseSeconds);
 
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(timeoutMs);
         factory.setReadTimeout(timeoutMs);
-        this.restTemplate = new RestTemplate(factory);
+        this.httpSender = new WebhookHttpSender(new RestTemplate(factory));
     }
 
-    @Transactional
     public void registerMerchantEndpoint(UUID merchantId, String webhookUrl, String webhookSecret) {
         WebhookSsrfValidator.validateAtDeliveryTime(webhookUrl, allowLocalInTest);
-        jdbcClient.sql("""
-                INSERT INTO merchant_webhook_endpoints (merchant_id, webhook_url, webhook_secret, updated_at)
-                VALUES (:merchantId, :webhookUrl, :webhookSecret, :updatedAt)
-                ON CONFLICT (merchant_id) DO UPDATE
-                SET webhook_url = EXCLUDED.webhook_url,
-                    webhook_secret = EXCLUDED.webhook_secret,
-                    updated_at = EXCLUDED.updated_at
+        int updated = jdbcClient.sql("""
+                UPDATE merchants
+                SET webhook_url = :webhookUrl, webhook_secret = :webhookSecret
+                WHERE id = :merchantId
                 """)
                 .param("merchantId", merchantId)
                 .param("webhookUrl", webhookUrl)
                 .param("webhookSecret", webhookSecret)
-                .param("updatedAt", Timestamp.from(clockProvider.now()))
                 .update();
+        if (updated == 0) throw PayCoreException.notFound("Merchant", merchantId);
     }
 
     @KafkaListener(
@@ -115,19 +114,28 @@ public class WebhookDeliveryService {
         consumeRawEvent(rawPayload);
     }
 
+    @Scheduled(fixedDelayString = "${paycore.webhook.retry-poll-interval-ms:1000}")
+    public void scheduledRetryTick() {
+        try {
+            processDueRetries(clockProvider.now());
+        } catch (Exception e) {
+            log.warn("Webhook retry worker failed and will retry on the next poll: {}", e.getMessage());
+        }
+    }
+
     /**
      * Processes a raw Protobuf message from the event bus.
      * Poison messages are routed directly to the DLQ so they never block a partition (Section 6.2 #4 & 7.8).
      */
-    @Transactional
     public DeliveryOutcome consumeRawEvent(byte[] rawPayload) {
         PaymentEvent event;
+        UUID eventId;
         try {
             event = PaymentEvent.parseFrom(rawPayload);
             if (event.getEventId().isBlank() || event.getMerchantId().isBlank()) {
                 throw new InvalidProtocolBufferException("Missing required event_id or merchant_id in PaymentEvent");
             }
-            UUID.fromString(event.getEventId());
+            eventId = UUID.fromString(event.getEventId());
             UUID.fromString(event.getMerchantId());
         } catch (Exception poisonEx) {
             UUID dlqId = recordDlqEvent(null, null, null, rawPayload, "POISON_MESSAGE: " + poisonEx.getMessage());
@@ -135,95 +143,189 @@ public class WebhookDeliveryService {
             return new DeliveryOutcome(DeliveryStatus.DEAD_LETTERED, null, dlqId, 0);
         }
 
+        byte[] claimedPayload = claimEventWork(eventId, rawPayload);
+        if (claimedPayload == null) return new DeliveryOutcome(DeliveryStatus.DUPLICATE_IGNORED, null, null, 0);
+        try {
+            DeliveryOutcome outcome = processClaimedEvent(event);
+            completeEventWork(eventId);
+            return outcome;
+        } catch (RuntimeException failure) {
+            releaseEventWork(eventId);
+            throw failure;
+        }
+    }
+
+    private DeliveryOutcome processClaimedEvent(PaymentEvent event) {
         UUID eventId = UUID.fromString(event.getEventId());
         UUID merchantId = UUID.fromString(event.getMerchantId());
-
-        // Acquire per-event transaction-scoped advisory lock to eliminate TOCTOU race across concurrent consumers
-        jdbcClient.sql("SELECT pg_advisory_xact_lock(hashtext(:lockKey))")
-                .param("lockKey", CONSUMER_NAME + ":" + eventId)
-                .query((rs, rowNum) -> 1)
-                .optional();
-
-        // Atomic dedupe check in processed_events & in-flight deliveries (Section 5.4 & 6.2 #3)
         int existingAttempts = countAttemptsForEvent(eventId);
         if (isAlreadyProcessed(eventId) || existingAttempts > 0) {
             return new DeliveryOutcome(DeliveryStatus.DUPLICATE_IGNORED, null, null, 0);
         }
-
         Optional<EndpointConfig> endpointOpt = findEndpoint(merchantId);
         if (endpointOpt.isEmpty()) {
+            UUID dlqId = recordDlqEvent(eventId.toString(), event.getPaymentId(), merchantId.toString(),
+                    event.toByteArray(), "MISSING_WEBHOOK_ENDPOINT");
             markProcessed(eventId);
-            return new DeliveryOutcome(DeliveryStatus.DELIVERED, null, null, 1);
+            return new DeliveryOutcome(DeliveryStatus.DEAD_LETTERED, null, dlqId, 0);
         }
-
         EndpointConfig endpoint = endpointOpt.get();
-        String payloadJson = buildWebhookJsonPayload(event);
         String traceparent = event.getTraceContextMap().getOrDefault(
                 TraceHeaders.TRACEPARENT, TraceHeaders.currentTraceparentOrGenerate());
+        return attemptDelivery(eventId, event.getPaymentId(), merchantId, existingAttempts + 1,
+                endpoint.webhookUrl(), endpoint.webhookSecret(), buildWebhookJsonPayload(event),
+                traceparent, event.toByteArray());
+    }
 
-        int currentAttempt = existingAttempts + 1;
+    private byte[] claimEventWork(UUID eventId, byte[] payload) {
+        return transactionTemplate.execute(status -> jdbcClient.sql("""
+                        INSERT INTO webhook_event_work (event_id, raw_payload, status, lease_until, updated_at)
+                        VALUES (:eventId, :payload, 'PROCESSING', :leaseUntil, :now)
+                        ON CONFLICT (event_id) DO UPDATE
+                        SET raw_payload = EXCLUDED.raw_payload, status = 'PROCESSING',
+                            lease_until = EXCLUDED.lease_until, updated_at = EXCLUDED.updated_at
+                        WHERE webhook_event_work.status = 'PROCESSING'
+                          AND webhook_event_work.lease_until <= :now
+                        RETURNING raw_payload
+                        """)
+                .param("eventId", eventId).param("payload", payload)
+                .param("leaseUntil", Timestamp.from(clockProvider.now().plusSeconds(deliveryLeaseSeconds)))
+                .param("now", Timestamp.from(clockProvider.now()))
+                .query((rs, rowNum) -> rs.getBytes("raw_payload"))
+                .optional().orElse(null));
+    }
 
-        return attemptDelivery(
-                eventId,
-                event.getPaymentId(),
-                merchantId,
-                currentAttempt,
-                endpoint.webhookUrl(),
-                endpoint.webhookSecret(),
-                payloadJson,
-                traceparent,
-                rawPayload);
+    @Scheduled(fixedDelayString = "${paycore.webhook.event-work-poll-interval-ms:1000}")
+    public void recoverExpiredEventWork() {
+        try {
+            recoverExpiredEventWorkBatch();
+        } catch (Exception failure) {
+            log.warn("Expired webhook event-work recovery failed and will retry on the next poll: {}",
+                    failure.getMessage());
+        }
+    }
+
+    private void recoverExpiredEventWorkBatch() {
+        Instant now = clockProvider.now();
+        List<UUID> expired = transactionTemplate.execute(status -> jdbcClient.sql("""
+                        SELECT event_id FROM webhook_event_work
+                        WHERE status = 'PROCESSING' AND lease_until <= :now
+                        ORDER BY lease_until, event_id LIMIT 100 FOR UPDATE SKIP LOCKED
+                        """)
+                .param("now", Timestamp.from(now))
+                .query(UUID.class).list());
+        for (UUID eventId : expired) {
+            byte[] payload = transactionTemplate.execute(status -> jdbcClient.sql("""
+                            UPDATE webhook_event_work
+                            SET lease_until = :leaseUntil, updated_at = :now
+                            WHERE event_id = :eventId AND status = 'PROCESSING' AND lease_until <= :now
+                            RETURNING raw_payload
+                            """)
+                    .param("eventId", eventId)
+                    .param("now", Timestamp.from(now))
+                    .param("leaseUntil", Timestamp.from(now.plusSeconds(deliveryLeaseSeconds)))
+                    .query((rs, rowNum) -> rs.getBytes("raw_payload")).optional().orElse(null));
+            if (payload == null) continue;
+            try {
+                PaymentEvent event = PaymentEvent.parseFrom(payload);
+                processClaimedEvent(event);
+                completeEventWork(eventId);
+            } catch (Exception failure) {
+                releaseEventWork(eventId);
+                log.warn("Expired webhook event work {} failed and will be retried: {}", eventId, failure.getMessage());
+            }
+        }
+    }
+
+    private void completeEventWork(UUID eventId) {
+        jdbcClient.sql("UPDATE webhook_event_work SET status = 'COMPLETE', lease_until = NULL, updated_at = :now WHERE event_id = :eventId")
+                .param("eventId", eventId).param("now", Timestamp.from(clockProvider.now())).update();
+    }
+
+    private void releaseEventWork(UUID eventId) {
+        jdbcClient.sql("UPDATE webhook_event_work SET lease_until = NOW(), updated_at = :now WHERE event_id = :eventId AND status = 'PROCESSING'")
+                .param("eventId", eventId).param("now", Timestamp.from(clockProvider.now())).update();
     }
 
     /**
      * Executes all due scheduled retries from {@code webhook_deliveries} (delay-aware retry consumer).
      */
-    @Transactional
     public int processDueRetries(Instant asOf) {
-        List<WebhookDeliveryRow> dueRows = jdbcClient.sql("""
-                SELECT id, event_id, merchant_id, attempt, status, retry_topic, next_attempt_at,
-                       last_status_code, last_error, target_url, payload_json, traceparent, created_at
-                FROM webhook_deliveries
-                WHERE status = 'RETRY_SCHEDULED'
-                  AND next_attempt_at <= :asOf
-                ORDER BY next_attempt_at ASC, id ASC
-                FOR UPDATE SKIP LOCKED
-                """)
+        UUID claimToken = UUID.randomUUID();
+        List<WebhookDeliveryRow> dueRows = transactionTemplate.execute(status -> jdbcClient.sql("""
+                        WITH candidates AS (
+                            SELECT id FROM webhook_deliveries
+                            WHERE (status = 'RETRY_SCHEDULED' AND next_attempt_at <= :asOf)
+                               OR (status = 'DELIVERING' AND lease_until <= :asOf)
+                            ORDER BY COALESCE(next_attempt_at, lease_until), id
+                            LIMIT 100
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE webhook_deliveries d
+                        SET status = 'DELIVERING', claim_token = :claimToken,
+                            lease_until = :leaseUntil
+                        FROM candidates c
+                        WHERE d.id = c.id
+                        RETURNING d.id, d.event_id, d.merchant_id, d.attempt, d.status, d.retry_topic,
+                                  d.next_attempt_at, d.last_status_code, d.last_error, d.target_url,
+                                  d.payload_json, d.traceparent, d.created_at
+                        """)
                 .param("asOf", Timestamp.from(asOf))
+                .param("claimToken", claimToken)
+                .param("leaseUntil", Timestamp.from(asOf.plusSeconds(deliveryLeaseSeconds)))
                 .query(this::mapDeliveryRow)
-                .list();
+                .list());
 
         int processed = 0;
         for (WebhookDeliveryRow row : dueRows) {
             if (isAlreadyProcessed(row.eventId())) {
+                finalizeRetryClaim(row.id(), claimToken, "FAILED", null);
                 continue;
             }
-            // Mark previous scheduled row as superseded so only the latest attempt is active
-            jdbcClient.sql("UPDATE webhook_deliveries SET status = 'FAILED' WHERE id = :id")
-                    .param("id", row.id())
-                    .update();
-
+            boolean superseded = jdbcClient.sql("""
+                            SELECT EXISTS (SELECT 1 FROM webhook_deliveries
+                                           WHERE event_id = :eventId AND attempt > :attempt)
+                            """)
+                    .param("eventId", row.eventId())
+                    .param("attempt", row.attempt())
+                    .query(Boolean.class)
+                    .single();
+            if (superseded) {
+                finalizeRetryClaim(row.id(), claimToken, "FAILED", "Superseded by a later delivery attempt");
+                continue;
+            }
             Optional<EndpointConfig> endpointOpt = findEndpoint(row.merchantId());
             if (endpointOpt.isEmpty()) {
+                UUID dlqId = recordDlqEvent(row.eventId().toString(), null, row.merchantId().toString(),
+                        row.payloadJson().getBytes(java.nio.charset.StandardCharsets.UTF_8), "MISSING_WEBHOOK_ENDPOINT");
+                markProcessed(row.eventId());
+                finalizeRetryClaim(row.id(), claimToken, "FAILED", "MISSING_WEBHOOK_ENDPOINT");
                 continue;
             }
-
-            attemptDelivery(
-                    row.eventId(),
-                    "",
-                    row.merchantId(),
-                    row.attempt() + 1,
-                    row.targetUrl(),
-                    endpointOpt.get().webhookSecret(),
-                    row.payloadJson(),
-                    row.traceparent(),
-                    row.payloadJson().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            try {
+                attemptDelivery(
+                        row.eventId(), "", row.merchantId(), row.attempt() + 1,
+                        row.targetUrl(), endpointOpt.get().webhookSecret(), row.payloadJson(), row.traceparent(),
+                        row.payloadJson().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } finally {
+                finalizeRetryClaim(row.id(), claimToken, "FAILED", null);
+            }
             processed++;
         }
         return processed;
     }
 
-    @Transactional
+    private void finalizeRetryClaim(UUID id, UUID claimToken, String status, String error) {
+        jdbcClient.sql("""
+                UPDATE webhook_deliveries
+                SET status = :status, claim_token = NULL, lease_until = NULL,
+                    last_error = COALESCE(:error, last_error)
+                WHERE id = :id AND claim_token = :claimToken AND status = 'DELIVERING'
+                """)
+                .param("status", status).param("error", error)
+                .param("id", id).param("claimToken", claimToken).update();
+    }
+
     public DeliveryOutcome replayDelivery(UUID deliveryId) {
         WebhookDeliveryRow row = jdbcClient.sql("""
                 SELECT id, event_id, merchant_id, attempt, status, retry_topic, next_attempt_at,
@@ -252,7 +354,22 @@ public class WebhookDeliveryService {
                 row.payloadJson().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    @Transactional
+    public DeliveryOutcome replayDeliveryForMerchant(UUID merchantId, UUID deliveryId) {
+        boolean owned = jdbcClient.sql("""
+                SELECT EXISTS (
+                    SELECT 1 FROM webhook_deliveries WHERE id = :id AND merchant_id = :merchantId
+                )
+                """)
+                .param("id", deliveryId)
+                .param("merchantId", merchantId)
+                .query(Boolean.class)
+                .single();
+        if (!owned) {
+            throw PayCoreException.notFound("WebhookDelivery", deliveryId);
+        }
+        return replayDelivery(deliveryId);
+    }
+
     public DlqEventRow replayDlqEvent(UUID dlqId) {
         DlqEventRow dlq = jdbcClient.sql("""
                 SELECT id, event_id, payment_id, merchant_id, raw_payload, reason, replayed, created_at
@@ -319,38 +436,12 @@ public class WebhookDeliveryService {
         Instant now = clockProvider.now();
         UUID deliveryId = UuidV7.generate(now.toEpochMilli());
         String timestampSec = String.valueOf(now.getEpochSecond());
-        String signature = WebhookSigner.sign(webhookSecret, timestampSec, payloadJson);
 
-        Integer statusCode = null;
-        String errorMessage = null;
-        boolean delivered = false;
-
-        try {
-            WebhookSsrfValidator.validateAtDeliveryTime(targetUrl, allowLocalInTest);
-
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            headers.set(TraceHeaders.WEBHOOK_SIGNATURE, signature);
-            headers.set(TraceHeaders.WEBHOOK_TIMESTAMP, timestampSec);
-            headers.set(TraceHeaders.WEBHOOK_EVENT_ID, eventId.toString());
-            if (traceparent != null && !traceparent.isBlank()) {
-                headers.set(TraceHeaders.TRACEPARENT, traceparent);
-            }
-
-            ResponseEntity<String> resp = restTemplate.exchange(
-                    targetUrl, HttpMethod.POST, new HttpEntity<>(payloadJson, headers), String.class);
-            statusCode = resp.getStatusCode().value();
-            if (resp.getStatusCode().is2xxSuccessful()) {
-                delivered = true;
-            } else {
-                errorMessage = "HTTP " + statusCode;
-            }
-        } catch (HttpStatusCodeException httpEx) {
-            statusCode = httpEx.getStatusCode().value();
-            errorMessage = "HTTP " + statusCode + ": " + httpEx.getResponseBodyAsString();
-        } catch (Exception ex) {
-            errorMessage = ex.getMessage();
-        }
+        WebhookHttpSender.DeliveryResult httpResult = httpSender.send(
+                targetUrl, webhookSecret, eventId, timestampSec, payloadJson, traceparent, allowLocalInTest);
+        Integer statusCode = httpResult.statusCode();
+        String errorMessage = httpResult.errorMessage();
+        boolean delivered = httpResult.delivered();
 
         if (delivered) {
             insertDeliveryRow(
@@ -393,7 +484,6 @@ public class WebhookDeliveryService {
                     traceparent,
                     now);
 
-            publishToKafkaTopicSafely(retryTopic, paymentId, rawBytesForDlq);
             return new DeliveryOutcome(DeliveryStatus.RETRY_SCHEDULED, deliveryId, null, attempt);
         } else {
             insertDeliveryRow(
@@ -416,7 +506,6 @@ public class WebhookDeliveryService {
                     merchantId.toString(),
                     rawBytesForDlq,
                     "MAX_RETRIES_EXCEEDED: " + errorMessage);
-            publishToKafkaTopicSafely(DLQ_TOPIC, paymentId, rawBytesForDlq);
             return new DeliveryOutcome(DeliveryStatus.DEAD_LETTERED, deliveryId, dlqId, attempt);
         }
     }
@@ -524,8 +613,8 @@ public class WebhookDeliveryService {
     private Optional<EndpointConfig> findEndpoint(UUID merchantId) {
         return jdbcClient.sql("""
                 SELECT webhook_url, webhook_secret
-                FROM merchant_webhook_endpoints
-                WHERE merchant_id = :merchantId
+                FROM merchants
+                WHERE id = :merchantId AND webhook_url IS NOT NULL AND webhook_secret IS NOT NULL
                 """)
                 .param("merchantId", merchantId)
                 .query((rs, rowNum) -> new EndpointConfig(
@@ -562,6 +651,7 @@ public class WebhookDeliveryService {
             case REFUNDED -> {
                 data.put("refund_id", event.getRefunded().getRefundId());
                 data.put("refund_amount", event.getRefunded().getRefundAmount());
+                data.put("fee_reversed_amount", event.getRefunded().getFeeReversedAmount());
                 data.put("total_refunded_amount", event.getRefunded().getTotalRefundedAmount());
                 data.put("currency", event.getRefunded().getCurrency());
                 data.put("ledger_txn_id", event.getRefunded().getLedgerTxnId());

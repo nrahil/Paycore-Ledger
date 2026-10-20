@@ -5,8 +5,8 @@ import java.util.UUID;
 /**
  * Acquirer / PSP client contract (Section 4.3 & FR8).
  *
- * <p>Uses a deterministic {@code pspRef = paymentId + ":" + attemptNo} so retries and
- * unknown-outcome resolution queries are strictly idempotent at the PSP.
+ * <p>Authorization is keyed by deterministic {@code pspRef = paymentId + ":" + attemptNo};
+ * capture and refund calls use their durable operation UUID as the PSP idempotency identity.
  */
 public interface PspClient {
 
@@ -33,6 +33,7 @@ public interface PspClient {
     record PspCaptureRequest(
             UUID paymentId,
             UUID merchantId,
+            UUID operationId,
             String pspRef,
             long amountMinor,
             String currency) {}
@@ -40,6 +41,7 @@ public interface PspClient {
     record PspRefundRequest(
             UUID paymentId,
             UUID merchantId,
+            UUID operationId,
             String pspRef,
             long refundAmountMinor,
             String currency) {}

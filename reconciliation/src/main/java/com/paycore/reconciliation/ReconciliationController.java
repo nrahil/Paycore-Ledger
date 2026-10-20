@@ -8,6 +8,9 @@ import java.util.Map;
 import java.util.UUID;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,9 +29,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class ReconciliationController {
 
     private final ReconciliationService reconciliationService;
+    private final JdbcClient jdbcClient;
 
-    public ReconciliationController(ReconciliationService reconciliationService) {
+    public ReconciliationController(ReconciliationService reconciliationService, JdbcClient jdbcClient) {
         this.reconciliationService = reconciliationService;
+        this.jdbcClient = jdbcClient;
     }
 
     @PostMapping(value = "/v1/admin/reconciliation", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -58,7 +63,14 @@ public class ReconciliationController {
 
     @GetMapping("/readyz")
     public ResponseEntity<Map<String, String>> readyz() {
+        jdbcClient.sql("SELECT 1").query(Integer.class).single();
         return ResponseEntity.ok(Map.of("status", "READY", "service", "reconciliation"));
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, String>> handleInvalidSettlementFile(IllegalArgumentException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(Map.of("error", "INVALID_SETTLEMENT_FILE", "message", ex.getMessage()));
     }
 
     public record ReconciliationRequest(LocalDate settlementDate, String csvContent) {}

@@ -62,6 +62,7 @@ class LedgerPropertyTest {
                 "--spring.datasource.username=" + postgres.getUsername(),
                 "--spring.datasource.password=" + postgres.getPassword(),
                 "--paycore.redis.enabled=false",
+                "--paycore.security.admin-token=payments-test-admin",
                 "--paycore.resolver.interval-ms=3600000");
         merchantService = context.getBean(MerchantService.class);
         paymentService = context.getBean(PaymentService.class);
@@ -158,8 +159,12 @@ class LedgerPropertyTest {
 
         // Verify all mathematical ledger invariants after the randomized sequence
         TestRestTemplate client = new TestRestTemplate();
-        ResponseEntity<JsonNode> invResp = client.getForEntity(
-                "http://localhost:" + serverPort + "/v1/admin/invariants", JsonNode.class);
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.set("X-PayCore-Admin-Token", "payments-test-admin");
+        ResponseEntity<JsonNode> invResp = client.exchange(
+                "http://localhost:" + serverPort + "/v1/admin/invariants",
+                org.springframework.http.HttpMethod.GET,
+                new org.springframework.http.HttpEntity<>(headers), JsonNode.class);
         assertThat(invResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode report = invResp.getBody();
         assertThat(report.get("status").asText()).isEqualTo("PASS");

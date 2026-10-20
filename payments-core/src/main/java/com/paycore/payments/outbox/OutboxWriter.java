@@ -95,6 +95,7 @@ public class OutboxWriter {
             long eventSeq,
             UUID refundId,
             long refundAmount,
+            long feeReversedAmount,
             long totalRefundedAmount,
             String currency,
             UUID ledgerTxnId) {
@@ -102,6 +103,7 @@ public class OutboxWriter {
                 .setRefunded(RefundProcessed.newBuilder()
                         .setRefundId(refundId.toString())
                         .setRefundAmount(refundAmount)
+                        .setFeeReversedAmount(feeReversedAmount)
                         .setTotalRefundedAmount(totalRefundedAmount)
                         .setCurrency(currency)
                         .setLedgerTxnId(ledgerTxnId.toString())

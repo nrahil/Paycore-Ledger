@@ -106,6 +106,7 @@ class WebhookServiceIntegrationTest {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("paycore.webhook.kafka-listener-enabled", () -> "false");
         registry.add("paycore.webhook.allow-local-targets", () -> "true");
+        registry.add("paycore.security.admin-token", () -> "webhook-test-admin");
     }
 
     @Autowired
@@ -128,10 +129,28 @@ class WebhookServiceIntegrationTest {
         failSeventyPercentMode.set(false);
         deliveryService.setAllowLocalInTest(true);
 
-        jdbcClient.sql("TRUNCATE TABLE webhook_deliveries, dlq_events, processed_events, merchant_webhook_endpoints")
+        jdbcClient.sql("""
+                CREATE TABLE IF NOT EXISTS merchants (
+                    id UUID PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    api_key_hash VARCHAR(64) NOT NULL UNIQUE,
+                    webhook_url TEXT,
+                    webhook_secret TEXT,
+                    fee_bps INTEGER NOT NULL DEFAULT 200,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """).update();
+        jdbcClient.sql("TRUNCATE TABLE webhook_deliveries, dlq_events, processed_events, merchant_webhook_endpoints, webhook_event_work")
                 .update();
 
         merchantId = UuidV7.generate();
+        jdbcClient.sql("""
+                INSERT INTO merchants (id, name, api_key_hash, fee_bps, created_at)
+                VALUES (:id, 'test merchant', :apiKeyHash, 200, NOW())
+                """)
+                .param("id", merchantId)
+                .param("apiKeyHash", "test-hash-" + merchantId.toString().replace("-", ""))
+                .update();
         deliveryService.registerMerchantEndpoint(
                 merchantId, "http://127.0.0.1:" + mockMerchantPort + "/webhook", WEBHOOK_SECRET);
     }
@@ -166,6 +185,26 @@ class WebhookServiceIntegrationTest {
         assertThat(WebhookSigner.verify(
                         WEBHOOK_SECRET, hook.timestampHeader(), hook.body() + "tamper", hook.signatureHeader()))
                 .isFalse();
+    }
+
+    @Test
+    @DisplayName("Events for merchants without a configured endpoint are visible in the DLQ")
+    void missingEndpointIsNotReportedAsDelivered() {
+        UUID merchantWithoutEndpoint = UuidV7.generate();
+        jdbcClient.sql("""
+                INSERT INTO merchants (id, name, api_key_hash, fee_bps, created_at)
+                VALUES (:id, 'unconfigured merchant', :apiKeyHash, 200, NOW())
+                """)
+                .param("id", merchantWithoutEndpoint)
+                .param("apiKeyHash", "test-hash-" + merchantWithoutEndpoint.toString().replace("-", ""))
+                .update();
+
+        DeliveryOutcome outcome = deliveryService.consumeRawEvent(buildCapturedEvent(
+                UuidV7.generate(), UuidV7.generate(), merchantWithoutEndpoint, 2L, 1_500L, 43L));
+
+        assertThat(outcome.status()).isEqualTo(DeliveryStatus.DEAD_LETTERED);
+        assertThat(deliveryService.listDlqEvents())
+                .anySatisfy(dlq -> assertThat(dlq.reason()).isEqualTo("MISSING_WEBHOOK_ENDPOINT"));
     }
 
     @Test
@@ -224,8 +263,12 @@ class WebhookServiceIntegrationTest {
 
         // Operator triggers POST /v1/admin/webhooks/{id}/replay on the latest delivery row
         UUID latestDeliveryId = deliveryService.listDeliveries(merchantId).get(0).id();
-        ResponseEntity<DeliveryOutcome> replayResp = restTemplate.postForEntity(
-                "/v1/admin/webhooks/" + latestDeliveryId + "/replay", null, DeliveryOutcome.class);
+        org.springframework.http.HttpHeaders adminHeaders = new org.springframework.http.HttpHeaders();
+        adminHeaders.set("X-PayCore-Admin-Token", "webhook-test-admin");
+        ResponseEntity<DeliveryOutcome> replayResp = restTemplate.exchange(
+                "/v1/admin/webhooks/" + latestDeliveryId + "/replay",
+                org.springframework.http.HttpMethod.POST,
+                new org.springframework.http.HttpEntity<>(null, adminHeaders), DeliveryOutcome.class);
         assertThat(replayResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(replayResp.getBody()).isNotNull();
         assertThat(replayResp.getBody().status()).isEqualTo(DeliveryStatus.DELIVERED);

@@ -45,6 +45,7 @@ val checkProtoCompatibility by tasks.registering {
             "PaymentAuthorized authorized = 20;",
             "PaymentCaptured captured = 21;",
             "RefundProcessed refunded = 22;",
+            "int64 fee_reversed_amount = 6;",
             "PayoutCreated payout = 23;"
         )
         requiredFieldTags.forEach { expected ->

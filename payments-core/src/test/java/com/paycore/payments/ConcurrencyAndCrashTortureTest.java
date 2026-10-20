@@ -45,7 +45,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
- * Concurrency, Race Condition, Naive-vs-Locked Contrast, and 1,000-Iteration Crash Consistency Suite
+ * Concurrency, race-condition, and 1,000-iteration crash consistency suite
  * (Section 7.1, 7.2, 7.4, 7.5).
  */
 @SpringBootTest(
@@ -55,7 +55,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
             "spring.datasource.hikari.connection-timeout=10000",
             "server.tomcat.accept-count=1000",
             "server.tomcat.max-connections=2000",
-            "paycore.resolver.interval-ms=3600000"
+            "paycore.resolver.interval-ms=3600000",
+            "paycore.security.admin-token=payments-test-admin"
         })
 @Testcontainers
 class ConcurrencyAndCrashTortureTest {
@@ -86,7 +87,6 @@ class ConcurrencyAndCrashTortureTest {
     @BeforeEach
     void setUp() {
         pspClient.clearFaults();
-        paymentService.setNaiveUnlockedRefundMode(false);
         paymentService.setCrashHook(stage -> {});
         idempotencyService.setRedisEnabled(false);
     }
@@ -94,7 +94,6 @@ class ConcurrencyAndCrashTortureTest {
     @AfterEach
     void tearDown() {
         pspClient.clearFaults();
-        paymentService.setNaiveUnlockedRefundMode(false);
         paymentService.setCrashHook(stage -> {});
         idempotencyService.setRedisEnabled(false);
     }
@@ -196,18 +195,17 @@ class ConcurrencyAndCrashTortureTest {
 
         assertThat(status422Count.get()).isEqualTo(500);
         assertInvariantsHealthy();
-        log.info("[RESUME METRIC] 500 concurrent same-key requests -> 500 identical responses, 1 payment row, 1 ledger txn, 500/500 payload mismatches rejected with 422.");
+        log.info("[IDEMPOTENCY TEST] 500 concurrent same-key requests -> 500 identical responses, 1 payment row, 1 ledger txn, 500/500 payload mismatches rejected with 422.");
     }
 
     /**
-     * Section 7.2: Double-capture & double-refund races, including the naive unlocked implementation contrast.
+     * Section 7.2: Concurrent capture/refund calls preserve single-capture and refund-cap invariants.
      * - 200 concurrent captures on one payment: exactly one succeeds.
-     * - 100 concurrent partial refunds that together exceed captured_amount:
-     *   1) Naive unlocked implementation FAILS (over-refunds in the ledger + lost update on payment).
-     *   2) Production locked implementation (SELECT ... FOR UPDATE) SUCCEEDS (total refunded never exceeds captured_amount).
+     * - 100 concurrent partial refunds that together exceed captured_amount: production row locking and
+     *   durable reservations allow at most the captured amount to be refunded.
      */
     @Test
-    void doubleCapture200RaceAndDoubleRefund100RaceWithNaiveContrast() throws Exception {
+    void doubleCapture200RaceAndDoubleRefund100RaceRespectOperationInvariants() throws Exception {
         MerchantService.CreatedMerchantResponse merchant = onboardMerchant("RaceMerchant", 200);
 
         // --- Part A: 200 Concurrent Captures on One Payment (with distinct idempotency keys) ---
@@ -245,70 +243,13 @@ class ConcurrencyAndCrashTortureTest {
         assertThat(captureSuccesses.get()).isEqualTo(1);
         assertThat(captureConflicts.get()).isEqualTo(199);
 
-        // --- Part B1: Deliberately Naive Unlocked Refund Contrast (100 concurrent partial refunds of 200 paise on 1000 paise payment) ---
-        Payment naivePayment = createAuthorizeAndCapture(merchant.apiKey(), "idem-naive-ref-prep", 1000L);
-        paymentService.setNaiveUnlockedRefundMode(true);
-
-        int refundThreads = 100;
-        CountDownLatch naiveGun = new CountDownLatch(1);
-        AtomicInteger naiveRefundSuccesses = new AtomicInteger(0);
-
-        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
-            List<Future<?>> futures = new ArrayList<>(refundThreads);
-            for (int i = 0; i < refundThreads; i++) {
-                final int idx = i;
-                futures.add(pool.submit(() -> {
-                    awaitLatch(naiveGun);
-                    try {
-                        paymentService.refundPayment(
-                                merchant.id(),
-                                naivePayment.id(),
-                                new PaymentService.RefundRequest(200L, "naive-race-" + idx));
-                        naiveRefundSuccesses.incrementAndGet();
-                    } catch (Exception ignored) {
-                    }
-                }));
-            }
-            naiveGun.countDown();
-            for (Future<?> f : futures) {
-                f.get();
-            }
-        }
-
-        // In naive mode without SELECT ... FOR UPDATE, way more than 5 refunds (5 * 200 = 1000) succeed!
-        long naiveLedgerRefunded = jdbcClient.sql("""
-                SELECT COALESCE(SUM(le.amount), 0)
-                FROM ledger_transactions lt
-                JOIN ledger_entries le ON le.txn_id = lt.id
-                WHERE lt.payment_id = :paymentId
-                  AND lt.kind = 'REFUND'
-                  AND le.direction = 'DEBIT'
-                """)
-                .param("paymentId", naivePayment.id())
-                .query(Long.class)
-                .single();
-
-        log.info("[NAIVE CONTRAST PROOF] Without SELECT ... FOR UPDATE, 100 concurrent 200-paise refunds on a 1000-paise payment succeeded {} times (ledger refunded {} paise > 1000 paise captured)!",
-                naiveRefundSuccesses.get(), naiveLedgerRefunded);
-        assertThat(naiveRefundSuccesses.get()).isGreaterThan(5);
-        assertThat(naiveLedgerRefunded).isGreaterThan(1000L);
-
-        // Verify the Invariant Checker catches the naive violation (status == FAIL, illegalPayments > 0)
-        ResponseEntity<JsonNode> naiveInvariantResp = restTemplate.getForEntity("/v1/admin/invariants", JsonNode.class);
-        assertThat(naiveInvariantResp.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
-        assertThat(naiveInvariantResp.getBody().get("status").asText()).isEqualTo("FAIL");
-        assertThat(naiveInvariantResp.getBody().get("illegalPayments").asLong()).isGreaterThanOrEqualTo(1L);
-
-        // Clean up the naive payment's corrupted state and restore balances before running the locked production test
-        cleanupNaivePaymentState(naivePayment.id());
-        paymentService.setNaiveUnlockedRefundMode(false);
-        assertInvariantsHealthy();
-
-        // --- Part B2: Production Locked Refund Path (SELECT ... FOR UPDATE) ---
+        // --- Part B: Production Locked Refund Path (SELECT ... FOR UPDATE) ---
         Payment lockedPayment = createAuthorizeAndCapture(merchant.apiKey(), "idem-locked-ref-prep", 1000L);
+        int refundThreads = 100;
         CountDownLatch lockedGun = new CountDownLatch(1);
         AtomicInteger lockedSuccesses = new AtomicInteger(0);
         AtomicInteger lockedRejections = new AtomicInteger(0);
+        AtomicInteger lockedStateConflicts = new AtomicInteger(0);
 
         try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
             List<Future<?>> futures = new ArrayList<>(refundThreads);
@@ -326,6 +267,8 @@ class ConcurrencyAndCrashTortureTest {
                         lockedSuccesses.incrementAndGet();
                     } else if (resp.getStatusCode() == HttpStatus.UNPROCESSABLE_ENTITY) {
                         lockedRejections.incrementAndGet();
+                    } else if (resp.getStatusCode() == HttpStatus.CONFLICT) {
+                        lockedStateConflicts.incrementAndGet();
                     }
                 }));
             }
@@ -337,12 +280,13 @@ class ConcurrencyAndCrashTortureTest {
 
         // Production locked path: exactly 5 refunds of 200 paise (= 1000 paise) succeed, 95 rejected with 422!
         assertThat(lockedSuccesses.get()).isEqualTo(5);
-        assertThat(lockedRejections.get()).isEqualTo(95);
+        assertThat(lockedRejections.get() + lockedStateConflicts.get()).isEqualTo(95);
 
         Payment afterLockedRefunds = paymentService.getPayment(merchant.id(), lockedPayment.id());
         assertThat(afterLockedRefunds.refundedAmount()).isEqualTo(1000L);
         assertInvariantsHealthy();
-        log.info("[RESUME METRIC] 200 concurrent captures -> 1 succeeded; 100 concurrent partial refunds -> 5/5 valid succeeded (1000/1000 paise), 95 rejected, 0 drift.");
+        log.info("[CONCURRENCY TEST] 200 concurrent captures -> 1 succeeded; 100 concurrent partial refunds -> 5 valid succeeded (1000/1000 paise), {} over-refund rejections, {} terminal-state conflicts, 0 drift.",
+                lockedRejections.get(), lockedStateConflicts.get());
     }
 
     /**
@@ -486,51 +430,8 @@ class ConcurrencyAndCrashTortureTest {
 
         // Run invariant checker across the entire database
         assertInvariantsHealthy();
-        log.info("[RESUME METRIC] 1000 iterations ({} injected crashes & PSP faults, {} converged by resolver) -> 0 invariant violations, 0 stuck AUTHORIZING payments, 0 lost events.",
+        log.info("[FAULT RECOVERY TEST] 1000 iterations ({} injected crashes & PSP faults, {} converged by resolver) -> 0 invariant violations, 0 stuck AUTHORIZING payments, 0 lost events.",
                 injectedCrashAndFaultCount, resolved);
-    }
-
-    private void cleanupNaivePaymentState(UUID naivePaymentId) {
-        // Recompute account_balances from remaining entries after deleting the intentionally corrupted naive test payment
-        jdbcClient.sql("ALTER TABLE ledger_entries DISABLE TRIGGER trg_ledger_entries_append_only").update();
-        jdbcClient.sql("ALTER TABLE ledger_entries DISABLE TRIGGER ALL").update();
-        jdbcClient.sql("""
-                DELETE FROM ledger_entries
-                WHERE txn_id IN (SELECT id FROM ledger_transactions WHERE payment_id = :pId)
-                """)
-                .param("pId", naivePaymentId)
-                .update();
-        jdbcClient.sql("ALTER TABLE ledger_entries ENABLE TRIGGER ALL").update();
-        jdbcClient.sql("DELETE FROM ledger_transactions WHERE payment_id = :pId")
-                .param("pId", naivePaymentId)
-                .update();
-        jdbcClient.sql("DELETE FROM outbox_events WHERE aggregate_id = :pId")
-                .param("pId", naivePaymentId)
-                .update();
-        jdbcClient.sql("DELETE FROM payment_attempts WHERE payment_id = :pId")
-                .param("pId", naivePaymentId)
-                .update();
-        jdbcClient.sql("DELETE FROM payments WHERE id = :pId")
-                .param("pId", naivePaymentId)
-                .update();
-        jdbcClient.sql("""
-                UPDATE account_balances ab
-                SET balance = COALESCE((
-                    SELECT SUM(
-                        CASE
-                            WHEN a.type = 'ASSET' AND le.direction = 'DEBIT'  THEN  le.amount
-                            WHEN a.type = 'ASSET' AND le.direction = 'CREDIT' THEN -le.amount
-                            WHEN a.type <> 'ASSET' AND le.direction = 'CREDIT' THEN  le.amount
-                            WHEN a.type <> 'ASSET' AND le.direction = 'DEBIT'  THEN -le.amount
-                            ELSE 0
-                        END
-                    )
-                    FROM accounts a
-                    LEFT JOIN ledger_entries le ON le.account_id = a.id
-                    WHERE a.id = ab.account_id
-                    GROUP BY a.id
-                ), 0)
-                """).update();
     }
 
     private Payment createAndAuthorize(String apiKey, String keyPrefix, long amount) {
@@ -568,7 +469,7 @@ class ConcurrencyAndCrashTortureTest {
     }
 
     private void assertInvariantsHealthy() {
-        ResponseEntity<JsonNode> inv = restTemplate.getForEntity("/v1/admin/invariants", JsonNode.class);
+        ResponseEntity<JsonNode> inv = getAdminInvariants();
         assertThat(inv.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode body = inv.getBody();
         assertThat(body.get("status").asText()).isEqualTo("PASS");
@@ -578,6 +479,12 @@ class ConcurrencyAndCrashTortureTest {
         assertThat(body.get("negativeMerchantAccounts").asLong()).isZero();
         assertThat(body.get("ledgerDrift").asLong()).isZero();
         assertThat(body.get("illegalPayments").asLong()).isZero();
+    }
+
+    private ResponseEntity<JsonNode> getAdminInvariants() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-PayCore-Admin-Token", "payments-test-admin");
+        return restTemplate.exchange("/v1/admin/invariants", HttpMethod.GET, new HttpEntity<>(headers), JsonNode.class);
     }
 
     private <T> ResponseEntity<T> postWithKey(

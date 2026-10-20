@@ -10,6 +10,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -25,26 +26,48 @@ import org.springframework.web.bind.annotation.RestController;
 public class WebhookController {
 
     private final WebhookDeliveryService webhookService;
+    private final JdbcClient jdbcClient;
 
-    public WebhookController(WebhookDeliveryService webhookService) {
+    public WebhookController(WebhookDeliveryService webhookService, JdbcClient jdbcClient) {
         this.webhookService = webhookService;
+        this.jdbcClient = jdbcClient;
     }
 
     @PostMapping("/v1/webhook-endpoints")
-    public ResponseEntity<Map<String, String>> registerEndpoint(@RequestBody RegisterEndpointRequest request) {
+    public ResponseEntity<Map<String, String>> registerEndpoint(
+            HttpServletRequest httpRequest, @RequestBody RegisterEndpointRequest request) {
+        UUID authenticatedMerchantId = requireMerchantId(httpRequest);
+        if (request.merchantId() != null && !request.merchantId().equals(authenticatedMerchantId)) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    HttpStatus.FORBIDDEN, "Cannot register a webhook endpoint for another merchant");
+        }
         webhookService.registerMerchantEndpoint(
-                request.merchantId(), request.webhookUrl(), request.webhookSecret());
+                authenticatedMerchantId, request.webhookUrl(), request.webhookSecret());
         return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("status", "REGISTERED"));
     }
 
     @GetMapping("/v1/webhook-deliveries")
     public ResponseEntity<List<WebhookDeliveryService.WebhookDeliveryRow>> listDeliveries(
+            HttpServletRequest httpRequest,
             @RequestParam(value = "merchantId", required = false) UUID merchantId) {
-        return ResponseEntity.ok(webhookService.listDeliveries(merchantId));
+        UUID authenticatedMerchantId = requireMerchantId(httpRequest);
+        if (merchantId != null && !merchantId.equals(authenticatedMerchantId)) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    HttpStatus.FORBIDDEN, "Cannot access another merchant's deliveries");
+        }
+        return ResponseEntity.ok(webhookService.listDeliveries(authenticatedMerchantId));
     }
 
-    @PostMapping({"/v1/webhook-deliveries/{id}/replay", "/v1/admin/webhooks/{id}/replay"})
+    @PostMapping("/v1/webhook-deliveries/{id}/replay")
     public ResponseEntity<WebhookDeliveryService.DeliveryOutcome> replayDelivery(
+            HttpServletRequest request,
+            @PathVariable("id") UUID deliveryId) {
+        return ResponseEntity.ok(webhookService.replayDeliveryForMerchant(
+                requireMerchantId(request), deliveryId));
+    }
+
+    @PostMapping("/v1/admin/webhooks/{id}/replay")
+    public ResponseEntity<WebhookDeliveryService.DeliveryOutcome> replayDeliveryAsAdmin(
             @PathVariable("id") UUID deliveryId) {
         return ResponseEntity.ok(webhookService.replayDelivery(deliveryId));
     }
@@ -72,6 +95,7 @@ public class WebhookController {
 
     @GetMapping("/readyz")
     public ResponseEntity<Map<String, String>> readyz() {
+        jdbcClient.sql("SELECT 1").query(Integer.class).single();
         return ResponseEntity.ok(Map.of("status", "READY", "service", "webhook-service"));
     }
 
@@ -90,4 +114,13 @@ public class WebhookController {
     }
 
     public record RegisterEndpointRequest(UUID merchantId, String webhookUrl, String webhookSecret) {}
+
+    private UUID requireMerchantId(HttpServletRequest request) {
+        UUID merchantId = (UUID) request.getAttribute(WebhookAccessFilter.MERCHANT_ID_ATTR);
+        if (merchantId == null) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    HttpStatus.UNAUTHORIZED, "Authenticated merchant required");
+        }
+        return merchantId;
+    }
 }

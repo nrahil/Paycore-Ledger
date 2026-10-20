@@ -1,6 +1,7 @@
 package com.paycore.payments.ledger;
 
 import com.paycore.common.errors.PayCoreException;
+import com.paycore.payments.merchant.MerchantAuthFilter;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import java.util.UUID;
@@ -28,8 +29,13 @@ class LedgerController {
 
     @GetMapping("/v1/payments/{id}/ledger")
     ResponseEntity<List<LedgerService.LedgerEntryView>> getPaymentLedgerEntries(
+            HttpServletRequest request,
             @PathVariable("id") UUID paymentId) {
-        return ResponseEntity.ok(ledgerService.findEntriesForPayment(paymentId));
+        UUID merchantId = (UUID) request.getAttribute(MerchantAuthFilter.MERCHANT_ID_ATTR);
+        if (merchantId == null) {
+            throw PayCoreException.unauthorized("Missing authenticated merchant context");
+        }
+        return ResponseEntity.ok(ledgerService.findEntriesForPayment(merchantId, paymentId));
     }
 
     @GetMapping("/v1/merchants/me/balance")

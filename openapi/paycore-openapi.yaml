@@ -32,7 +32,17 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
-      description: SHA-256 hashed merchant API key verified by the Go gateway.
+      description: Merchant API key validated by the receiving service; the authenticated merchant ID is derived from it.
+    AdminOperatorToken:
+      type: apiKey
+      in: header
+      name: X-PayCore-Admin-Token
+      description: Separate operator credential required for administrative APIs.
+    InternalServiceToken:
+      type: apiKey
+      in: header
+      name: X-PayCore-Internal-Token
+      description: Shared credential required for trusted service-to-service APIs.
 
   parameters:
     IdempotencyKeyHeader:
@@ -122,6 +132,7 @@ components:
         - CREATED
         - AUTHORIZING
         - AUTHORIZED
+        - CAPTURING
         - CAPTURED
         - PARTIALLY_REFUNDED
         - REFUNDED
@@ -292,6 +303,41 @@ components:
           format: date-time
           example: "2026-10-12T15:02:30.000Z"
 
+    RefundResponse:
+      type: object
+      required: [refundId, paymentId, merchantId, refundAmount, totalRefundedAmount, capturedAmount, currency, feeReversedAmount, ledgerTxnId, createdAt]
+      properties:
+        refundId:
+          type: string
+          format: uuid
+        paymentId:
+          type: string
+          format: uuid
+        merchantId:
+          type: string
+          format: uuid
+        refundAmount:
+          type: integer
+          format: int64
+        totalRefundedAmount:
+          type: integer
+          format: int64
+        capturedAmount:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        feeReversedAmount:
+          type: integer
+          format: int64
+          description: Platform fee amount reversed proportionally by this refund.
+        ledgerTxnId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+
     LedgerEntryResponse:
       type: object
       required: [entryId, txnId, accountId, side, amountPaise, currency, createdAt]
@@ -371,7 +417,7 @@ components:
 
     ReconciliationRunResponse:
       type: object
-      required: [runId, settlementDate, matchedCount, discrepancyCount, discrepancies]
+      required: [runId, settlementDate, matched, discrepancyCount, createdAt, discrepancies]
       properties:
         runId:
           type: string
@@ -380,7 +426,7 @@ components:
           type: string
           format: date
           example: "2026-10-11"
-        matchedCount:
+        matched:
           type: integer
           example: 1247
         discrepancyCount:
@@ -394,24 +440,32 @@ components:
             properties:
               pspRef:
                 type: string
-              type:
+              paymentId:
+                type: string
+                format: uuid
+                nullable: true
+              kind:
                 type: string
                 enum:
-                  - MATCHED
                   - MISSING_IN_LEDGER
                   - MISSING_IN_PSP_FILE
                   - AMOUNT_MISMATCH
                   - STATUS_MISMATCH
-              internalAmountPaise:
+                  - CURRENCY_MISMATCH
+              expectedAmt:
                 type: integer
                 format: int64
-              pspAmountPaise:
+                nullable: true
+              actualAmt:
                 type: integer
                 format: int64
-              internalStatus:
-                $ref: "#/components/schemas/PaymentStatus"
-              pspStatus:
-                type: string
+                nullable: true
+              details:
+                type: object
+                additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
 
     BalanceResponse:
       type: object
@@ -521,10 +575,78 @@ paths:
       description: >
         Reads from the denormalized `merchant_summary_view` maintained by `read-model-service`.
         Eventually consistent — may lag behind the authoritative `payments` table by the Kafka
-        event propagation delay (typically <100ms in dev, <5s under load).
+        event propagation delay. The response reports gross captured sales, refunds, platform fees,
+        completed payouts, and the remaining merchant payable; it is not a real-time ledger balance.
       responses:
         "200":
-          description: Projected merchant daily summary.
+          description: Eventually consistent sales, payout, and remaining-payable totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [merchantId, currencies]
+                properties:
+                  merchantId:
+                    type: string
+                    format: uuid
+                  currencies:
+                    type: array
+                    items:
+                      type: object
+                      required: [currency, totalCaptured, totalRefunded, totalFees, totalPayouts, netMerchantAmount, paymentCount, dailyBreakdown]
+                      properties:
+                        currency:
+                          type: string
+                          description: ISO currency code; amounts in this object are never added to another currency.
+                        totalCaptured:
+                          type: integer
+                          format: int64
+                        totalRefunded:
+                          type: integer
+                          format: int64
+                        totalFees:
+                          type: integer
+                          format: int64
+                        totalPayouts:
+                          type: integer
+                          format: int64
+                        netMerchantAmount:
+                          type: integer
+                          format: int64
+                          description: Captured minus refunds, net fees, and completed payouts; not a real-time ledger balance.
+                        paymentCount:
+                          type: integer
+                          format: int64
+                          description: Number of payments with a capture in this currency.
+                        dailyBreakdown:
+                          type: array
+                          items:
+                            type: object
+                            required: [merchantId, day, currency, captured, refunded, fees, payoutAmount, paymentCount]
+                            properties:
+                              merchantId:
+                                type: string
+                                format: uuid
+                              day:
+                                type: string
+                                format: date
+                              currency:
+                                type: string
+                              captured:
+                                type: integer
+                                format: int64
+                              refunded:
+                                type: integer
+                                format: int64
+                              fees:
+                                type: integer
+                                format: int64
+                              payoutAmount:
+                                type: integer
+                                format: int64
+                              paymentCount:
+                                type: integer
+                                format: int64
 
   # ── Payments ───────────────────────────────────────────────────────────────
   /v1/payments:
@@ -768,12 +890,15 @@ paths:
         Posts a reversing 3-leg double-entry ledger transaction:
         ```
         CREDIT PSP_RECEIVABLE:INR:<shard>   20000 paise   (return to PSP)
-        DEBIT  MERCHANT_PAYABLE:<merchantId>  20000 paise   (clawback from merchant)
+        DEBIT  MERCHANT_PAYABLE:<merchantId>  19600 paise   (claw back merchant's net share)
+        DEBIT  PLATFORM_FEE:INR                 400 paise   (reverse 2% fee proportionally)
         ```
-        **Over-refund protection:** A `SELECT ... FROM payments WHERE id = ? FOR UPDATE` row
+        The platform fee is reversed in proportion to the cumulative gross refund. Integer rounding is
+        deterministic; the final refund reverses any remaining fee paise. **Over-refund protection:** A `SELECT ... FROM payments WHERE id = ? FOR UPDATE` row
         lock serializes all concurrent refund requests. Each waking thread re-reads the latest
         `refunded_amount` before allowing or rejecting. 100 concurrent ₹200 refund requests on a
-        ₹1,000 capture: **exactly 5 succeed**, 95 are rejected with `422 OVER_REFUND_REJECTED`.
+        ₹1,000 capture: at most 5 succeed; remaining requests receive `422` for exceeding remaining
+        refundable balance or `409` when the payment is already terminally refunded.
 
         **State transitions:**
         - `CAPTURED` + partial refund → `PARTIALLY_REFUNDED`
@@ -794,12 +919,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaymentResponse"
+                $ref: "#/components/schemas/RefundResponse"
               example:
-                status: "PARTIALLY_REFUNDED"
+                refundAmount: 20000
+                totalRefundedAmount: 20000
+                feeReversedAmount: 400
                 capturedAmount: 100000
-                refundedAmount: 20000
-                version: 4
+                currency: "INR"
         "422":
           description: >
             Over-refund rejected — requested amount exceeds `capturedAmount − refundedAmount`.
@@ -876,6 +1002,8 @@ paths:
       summary: Run REPEATABLE READ ledger invariant verification (drift must be 0)
       operationId: checkLedgerInvariants
       tags: [Admin]
+      security:
+        - AdminOperatorToken: []
       description: >
         Executes `LedgerInvariantChecker` inside a `REPEATABLE READ` snapshot transaction.
         Computes `SUM(DEBIT) − SUM(CREDIT)` globally and verifies every account's
@@ -900,6 +1028,8 @@ paths:
       summary: Replay a failed or DLQ-transitioned webhook delivery
       operationId: replayWebhook
       tags: [Admin]
+      security:
+        - AdminOperatorToken: []
       parameters:
         - name: id
           in: path
@@ -920,9 +1050,12 @@ paths:
       summary: Ingest PSP settlement CSV and detect financial discrepancies
       operationId: runReconciliation
       tags: [Admin]
+      security:
+        - AdminOperatorToken: []
       description: |
         Ingests the PSP's T+1 settlement batch and cross-references against the internal ledger
-        snapshot filtered to `updated_at` within the settlement date window.
+        snapshot using the requested UTC settlement date and authoritative PSP-receivable ledger postings.
+        Duplicate PSP references, malformed rows, and rows from another settlement date are rejected.
 
         **Discrepancy categories:**
         | Type | Meaning |
@@ -932,16 +1065,17 @@ paths:
         | `MISSING_IN_PSP_FILE` | Our ledger recorded a capture; PSP file omits it |
         | `AMOUNT_MISMATCH` | Both have the record but settled amounts differ |
         | `STATUS_MISMATCH` | Status disagrees (e.g., PSP says `SETTLED`, we say `AUTHORIZED`) |
+        | `CURRENCY_MISMATCH` | PSP feed currency differs from the payment currency |
 
-        Net amount reconciliation: for `PARTIALLY_REFUNDED`/`REFUNDED` payments,
-        `expectedSettlementAmount = capturedAmount − refundedAmount`.
+        Expected amount is the net debit/credit movement on the payment's PSP-receivable ledger postings.
+        Include currency as the optional fifth CSV column; legacy four-column feeds are interpreted as INR.
       requestBody:
         required: true
         content:
           text/csv:
             schema:
               type: string
-              description: PSP settlement CSV (psp_ref, amount_paise, status, settlement_date)
+              description: PSP daily settlement movements (psp_ref, signed amount_paise, status, settled_at, optional currency). Refunds are negative movements on their ledger date.
       responses:
         "200":
           description: Reconciliation run report.
@@ -949,6 +1083,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReconciliationRunResponse"
+        "400":
+          description: Malformed feed, duplicate PSP reference, or row outside the requested settlement date.
 
   # ── Mock PSP (fault injection) ─────────────────────────────────────────────
   /psp/v1/authorizations:
@@ -956,6 +1092,8 @@ paths:
       summary: "[Mock PSP] Authorize a payment with the PSP"
       operationId: pspAuthorize
       tags: [Mock PSP]
+      security:
+        - InternalServiceToken: []
       description: >
         Creates a PSP authorization hold. Returns a `pspRef`. Fault injection is controlled via
         `POST /psp/v1/admin/fault-config`. Used internally by `ResilientPspClient`.
@@ -970,6 +1108,8 @@ paths:
       summary: "[Mock PSP] Look up authorization status by PSP reference"
       operationId: pspLookup
       tags: [Mock PSP]
+      security:
+        - InternalServiceToken: []
       parameters:
         - name: pspRef
           in: path
@@ -990,6 +1130,8 @@ paths:
       summary: "[Mock PSP] Confirm capture of a previously authorized payment"
       operationId: pspCapture
       tags: [Mock PSP]
+      security:
+        - InternalServiceToken: []
       parameters:
         - name: pspRef
           in: path
@@ -1021,6 +1163,8 @@ paths:
       summary: "[Mock PSP] Issue a refund at the PSP level"
       operationId: pspRefund
       tags: [Mock PSP]
+      security:
+        - InternalServiceToken: []
       parameters:
         - name: pspRef
           in: path
@@ -1054,6 +1198,8 @@ paths:
       summary: "[Mock PSP] Configure fault injection mode"
       operationId: pspSetFaultConfig
       tags: [Mock PSP]
+      security:
+        - AdminOperatorToken: []
       description: >
         Controls the fault injection mode for the mock PSP. Used by `ConcurrencyAndCrashTortureTest`
         to inject `FLAKY` mode (15% HTTP 500, 10% timeout) for the 1,000-iteration crash loop.
@@ -1075,13 +1221,15 @@ paths:
       summary: "[Mock PSP] Download T+1 settlement CSV"
       operationId: pspSettlementCsv
       tags: [Mock PSP]
+      security:
+        - InternalServiceToken: []
       description: >
-        Returns a CSV with all captured (and net-refunded) transactions for the settlement date.
+        Returns captured (net-refunded) transactions for the requested UTC settlement date, including currency.
         Ingested by `ReconciliationService` in `POST /v1/admin/reconciliation`.
       parameters:
-        - name: date
+        - name: settlementDate
           in: query
-          required: true
+          required: false
           schema:
             type: string
             format: date
@@ -1094,5 +1242,5 @@ paths:
               schema:
                 type: string
               example: |
-                psp_ref,amount_paise,status,settlement_date
-                psp_auth_9KL3M2N1,80000,SETTLED,2026-10-11
+                psp_ref,amount_paise,status,settled_at,currency
+                psp_auth_9KL3M2N1,80000,SETTLED,2026-10-11T10:00:00Z,INR

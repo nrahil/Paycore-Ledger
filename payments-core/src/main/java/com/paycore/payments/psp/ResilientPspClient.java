@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,24 +29,38 @@ public class ResilientPspClient implements PspClient {
 
     private final RestClient restClient;
     private final boolean httpEnabled;
+    private final String internalServiceToken;
     private final CircuitBreaker circuitBreaker;
     private final Bulkhead bulkhead;
 
     // In-memory ledger of PSP authorizations for embedded/fault-injection testing and idempotent PSP dedupe
     private final Map<String, PspStatusLookupResult> pspBook = new ConcurrentHashMap<>();
+    private final Map<UUID, PspCaptureResult> captureResultsByOperation = new ConcurrentHashMap<>();
+    private final Map<UUID, PspRefundResult> refundResultsByOperation = new ConcurrentHashMap<>();
     private final Map<UUID, FaultScript> faultScriptsByPaymentId = new ConcurrentHashMap<>();
     private volatile FaultMode globalFaultMode = FaultMode.NONE;
     private volatile long globalLatencyMs = 0L;
 
     public ResilientPspClient(
             @Value("${paycore.psp.base-url:}") String pspBaseUrl,
-            @Value("${paycore.psp.timeout-ms:1500}") int timeoutMs) {
+            @Value("${paycore.psp.timeout-ms:1500}") int timeoutMs,
+            @Value("${paycore.security.internal-token:}") String internalServiceToken) {
+        this(pspBaseUrl, timeoutMs, internalServiceToken, RestClient.builder());
+    }
+
+    @Autowired
+    public ResilientPspClient(
+            @Value("${paycore.psp.base-url:}") String pspBaseUrl,
+            @Value("${paycore.psp.timeout-ms:1500}") int timeoutMs,
+            @Value("${paycore.security.internal-token:}") String internalServiceToken,
+            RestClient.Builder restClientBuilder) {
         this.httpEnabled = pspBaseUrl != null && !pspBaseUrl.isBlank();
+        this.internalServiceToken = internalServiceToken == null ? "" : internalServiceToken.trim();
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(timeoutMs);
         factory.setReadTimeout(timeoutMs);
         this.restClient = httpEnabled
-                ? RestClient.builder().baseUrl(pspBaseUrl.trim()).requestFactory(factory).build()
+                ? restClientBuilder.clone().baseUrl(pspBaseUrl.trim()).requestFactory(factory).build()
                 : null;
 
         this.circuitBreaker = CircuitBreaker.of(
@@ -85,49 +100,111 @@ public class ResilientPspClient implements PspClient {
     public PspCaptureResult capture(PspCaptureRequest request) {
         long startNs = System.nanoTime();
         String ref = request.pspRef() != null ? request.pspRef() : request.paymentId() + ":1";
-        if (httpEnabled && restClient != null) {
-            try {
-                restClient.post()
-                        .uri("/psp/v1/captures/{pspRef}", ref)
-                        .body(Map.of(
-                                "paymentId", request.paymentId().toString(),
-                                "amountMinor", request.amountMinor(),
-                                "currency", request.currency()))
-                        .retrieve()
-                        .toBodilessEntity();
-            } catch (Exception ex) {
-                log.warn("PSP capture HTTP call warning for pspRef={}: {}", ref, ex.getMessage());
-            }
+        try {
+            return Bulkhead.decorateSupplier(
+                            bulkhead,
+                            CircuitBreaker.decorateSupplier(circuitBreaker, () -> executeCapture(request, ref, startNs)))
+                    .get();
+        } catch (Exception ex) {
+            long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+            log.warn("PSP capture failed for pspRef={}: {}", ref, ex.getMessage());
+            return new PspCaptureResult(PspOutcome.UNKNOWN_TIMEOUT, ref, latencyMs, ex.getMessage());
         }
-        pspBook.put(ref, new PspStatusLookupResult(PspLookupState.AUTHORIZED, ref, request.amountMinor()));
-        long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
-        return new PspCaptureResult(PspOutcome.AUTHORIZED, ref, latencyMs, "CAPTURED");
     }
 
     @Override
     public PspRefundResult refund(PspRefundRequest request) {
         long startNs = System.nanoTime();
         String ref = request.pspRef() != null ? request.pspRef() : request.paymentId() + ":1";
-        if (httpEnabled && restClient != null) {
-            try {
-                restClient.post()
-                        .uri("/psp/v1/refunds/{pspRef}", ref)
-                        .body(Map.of(
-                                "paymentId", request.paymentId().toString(),
-                                "refundAmountMinor", request.refundAmountMinor(),
-                                "currency", request.currency()))
-                        .retrieve()
-                        .toBodilessEntity();
-            } catch (Exception ex) {
-                log.warn("PSP refund HTTP call warning for pspRef={}: {}", ref, ex.getMessage());
-            }
+        try {
+            return Bulkhead.decorateSupplier(
+                            bulkhead,
+                            CircuitBreaker.decorateSupplier(circuitBreaker, () -> executeRefund(request, ref, startNs)))
+                    .get();
+        } catch (Exception ex) {
+            long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+            log.warn("PSP refund failed for pspRef={}: {}", ref, ex.getMessage());
+            return new PspRefundResult(PspOutcome.UNKNOWN_TIMEOUT, ref, latencyMs, ex.getMessage());
         }
-        pspBook.computeIfPresent(ref, (k, existing) -> new PspStatusLookupResult(
-                existing.state(),
-                ref,
-                Math.max(0L, existing.amountMinor() - request.refundAmountMinor())));
+    }
+
+    private synchronized PspCaptureResult executeCapture(PspCaptureRequest request, String ref, long startNs) {
+        PspCaptureResult prior = captureResultsByOperation.get(request.operationId());
+        if (prior != null) return prior;
+        if (httpEnabled && restClient != null) {
+            PspHttpAuthResponse response = restClient.post()
+                    .uri("/psp/v1/captures/{pspRef}", ref)
+                    .header("X-PayCore-Internal-Token", internalServiceToken)
+                    .header("Idempotency-Key", request.operationId().toString())
+                    .body(Map.of(
+                            "paymentId", request.paymentId().toString(),
+                            "amountMinor", request.amountMinor(),
+                            "currency", request.currency(),
+                            "operationId", request.operationId().toString()))
+                    .retrieve()
+                    .body(PspHttpAuthResponse.class);
+            long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+            if (response != null && "CAPTURED".equals(response.status())) {
+                pspBook.put(ref, new PspStatusLookupResult(PspLookupState.AUTHORIZED, ref, request.amountMinor()));
+                PspCaptureResult result = new PspCaptureResult(PspOutcome.AUTHORIZED, ref, latencyMs, "CAPTURED");
+                captureResultsByOperation.put(request.operationId(), result);
+                return result;
+            }
+            PspCaptureResult result = new PspCaptureResult(
+                    PspOutcome.DECLINED, ref, latencyMs, response != null ? response.reason() : "DECLINED");
+            captureResultsByOperation.put(request.operationId(), result);
+            return result;
+        }
+
+        pspBook.put(ref, new PspStatusLookupResult(PspLookupState.AUTHORIZED, ref, request.amountMinor()));
         long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
-        return new PspRefundResult(PspOutcome.AUTHORIZED, ref, latencyMs, "REFUNDED");
+        PspCaptureResult result = new PspCaptureResult(PspOutcome.AUTHORIZED, ref, latencyMs, "CAPTURED");
+        captureResultsByOperation.put(request.operationId(), result);
+        return result;
+    }
+
+    private synchronized PspRefundResult executeRefund(PspRefundRequest request, String ref, long startNs) {
+        PspRefundResult prior = refundResultsByOperation.get(request.operationId());
+        if (prior != null) return prior;
+        if (httpEnabled && restClient != null) {
+            PspHttpAuthResponse response = restClient.post()
+                    .uri("/psp/v1/refunds/{pspRef}", ref)
+                    .header("X-PayCore-Internal-Token", internalServiceToken)
+                    .header("Idempotency-Key", request.operationId().toString())
+                    .body(Map.of(
+                            "paymentId", request.paymentId().toString(),
+                            "refundAmountMinor", request.refundAmountMinor(),
+                            "currency", request.currency(),
+                            "operationId", request.operationId().toString()))
+                    .retrieve()
+                    .body(PspHttpAuthResponse.class);
+            long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+            if (response != null && "CAPTURED".equals(response.status())) {
+                pspBook.computeIfPresent(ref, (k, existing) -> new PspStatusLookupResult(
+                        existing.state(), ref, Math.max(0L, existing.amountMinor() - request.refundAmountMinor())));
+                PspRefundResult result = new PspRefundResult(PspOutcome.AUTHORIZED, ref, latencyMs, "REFUNDED");
+                refundResultsByOperation.put(request.operationId(), result);
+                return result;
+            }
+            PspRefundResult result = new PspRefundResult(
+                    PspOutcome.DECLINED, ref, latencyMs, response != null ? response.reason() : "DECLINED");
+            refundResultsByOperation.put(request.operationId(), result);
+            return result;
+        }
+
+        PspStatusLookupResult existing = pspBook.get(ref);
+        if (existing == null) {
+            long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+            PspRefundResult result = new PspRefundResult(PspOutcome.DECLINED, ref, latencyMs, "UNKNOWN_PSP_REF");
+            refundResultsByOperation.put(request.operationId(), result);
+            return result;
+        }
+        pspBook.computeIfPresent(ref, (k, current) -> new PspStatusLookupResult(
+                current.state(), ref, Math.max(0L, current.amountMinor() - request.refundAmountMinor())));
+        long latencyMs = Duration.ofNanos(System.nanoTime() - startNs).toMillis();
+        PspRefundResult result = new PspRefundResult(PspOutcome.AUTHORIZED, ref, latencyMs, "REFUNDED");
+        refundResultsByOperation.put(request.operationId(), result);
+        return result;
     }
 
     @Override
@@ -136,6 +213,7 @@ public class ResilientPspClient implements PspClient {
             try {
                 PspHttpLookupResponse resp = restClient.get()
                         .uri("/psp/v1/authorizations/{pspRef}", pspRef)
+                        .header("X-PayCore-Internal-Token", internalServiceToken)
                         .retrieve()
                         .body(PspHttpLookupResponse.class);
                 if (resp == null || "NOT_FOUND".equals(resp.status())) {
@@ -194,6 +272,7 @@ public class ResilientPspClient implements PspClient {
         if (httpEnabled && restClient != null) {
             PspHttpAuthResponse httpResp = restClient.post()
                     .uri("/psp/v1/authorizations")
+                    .header("X-PayCore-Internal-Token", internalServiceToken)
                     .body(new PspHttpAuthRequest(
                             request.paymentId().toString(),
                             request.merchantId().toString(),

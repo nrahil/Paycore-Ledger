@@ -10,7 +10,7 @@ import java.util.UUID;
  * <p>Accounting model (Section 5.1, Page 9):
  * <ul>
  *   <li>Capture: Debit PSP_RECEIVABLE (gross), Credit MERCHANT_PAYABLE (net), Credit PLATFORM_FEE_REVENUE (fee)</li>
- *   <li>Refund (fee not returned policy): Debit MERCHANT_PAYABLE (amount), Credit PSP_RECEIVABLE (amount)</li>
+ *   <li>Refund: Debit MERCHANT_PAYABLE (net), Debit PLATFORM_FEE_REVENUE (reversed fee), Credit PSP_RECEIVABLE (gross)</li>
  *   <li>Payout: Debit MERCHANT_PAYABLE (amount), Credit BANK (amount)</li>
  * </ul>
  */
@@ -31,8 +31,8 @@ public record LedgerTransaction(
         if (!grossAmount.isPositive()) {
             throw new IllegalArgumentException("Ledger transaction grossAmount must be > 0");
         }
-        if (feeAmount.isNegative() || feeAmount.compareTo(grossAmount) >= 0) {
-            throw new IllegalArgumentException("feeAmount must be >= 0 and < grossAmount");
+        if (feeAmount.isNegative() || feeAmount.compareTo(grossAmount) > 0) {
+            throw new IllegalArgumentException("feeAmount must be >= 0 and <= grossAmount");
         }
     }
 
@@ -44,14 +44,15 @@ public record LedgerTransaction(
     }
 
     public static LedgerTransaction forRefund(
-            UUID paymentId, UUID merchantId, Money refundAmount, String postedBy) {
+            UUID paymentId, UUID merchantId, Money refundAmount, Money feeReversal, String postedBy) {
         Objects.requireNonNull(paymentId, "paymentId is required for REFUND");
+        Objects.requireNonNull(feeReversal, "feeReversal is required for REFUND");
         return new LedgerTransaction(
                 paymentId,
                 merchantId,
                 LedgerTransactionKind.REFUND,
                 refundAmount,
-                Money.ofNonNegative(0L, refundAmount.currency()),
+                feeReversal,
                 postedBy);
     }
 

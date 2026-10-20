@@ -9,6 +9,8 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -64,20 +66,36 @@ public class ReadModelProjectorService {
         try {
             event = PaymentEvent.parseFrom(rawPayload);
         } catch (Exception e) {
-            log.warn("Read model ignoring malformed Protobuf payload: {}", e.getMessage());
+            quarantinePoisonEvent(rawPayload, e.getMessage());
+            log.warn("Read model quarantined malformed Protobuf payload: {}", e.getMessage());
             return;
         }
 
-        UUID eventId = UUID.fromString(event.getEventId());
-        UUID paymentId = UUID.fromString(event.getPaymentId());
+        UUID eventId;
+        UUID paymentId;
+        try {
+            eventId = UUID.fromString(event.getEventId());
+            paymentId = UUID.fromString(event.getPaymentId());
+            UUID.fromString(event.getMerchantId());
+            if (event.getEventSeq() <= 0) throw new IllegalArgumentException("event_seq must be positive");
+        } catch (RuntimeException invalidMetadata) {
+            quarantinePoisonEvent(rawPayload, invalidMetadata.getMessage());
+            return;
+        }
         long eventSeq = event.getEventSeq();
+
+        // A SELECT FOR UPDATE cannot lock a missing payment_view row; this lock serializes the first event too.
+        jdbcClient.sql("SELECT pg_advisory_xact_lock(hashtextextended(:lockKey, 0))")
+                .param("lockKey", CONSUMER_NAME + ":" + paymentId)
+                .query((rs, rowNum) -> 1)
+                .single();
 
         if (isAlreadyProcessed(eventId)) {
             return;
         }
 
         // Persist in event log for gap buffering and offset-0 rebuilds
-        jdbcClient.sql("""
+        int inserted = jdbcClient.sql("""
                 INSERT INTO read_model_event_log (payment_id, event_seq, event_id, raw_payload, received_at)
                 VALUES (:paymentId, :eventSeq, :eventId, :rawPayload, :receivedAt)
                 ON CONFLICT (payment_id, event_seq) DO NOTHING
@@ -89,12 +107,46 @@ public class ReadModelProjectorService {
                 .param("receivedAt", Timestamp.from(clockProvider.now()))
                 .update();
 
-        if ("payout.created".equals(event.getEventType())) {
-            markProcessed(eventId);
+        if (inserted == 0) {
+            UUID existingEventId = jdbcClient.sql("""
+                            SELECT event_id FROM read_model_event_log
+                            WHERE payment_id = :paymentId AND event_seq = :eventSeq
+                            """)
+                    .param("paymentId", paymentId).param("eventSeq", eventSeq)
+                    .query(UUID.class).single();
+            byte[] existingPayload = jdbcClient.sql("""
+                            SELECT raw_payload FROM read_model_event_log
+                            WHERE payment_id = :paymentId AND event_seq = :eventSeq
+                            """)
+                    .param("paymentId", paymentId).param("eventSeq", eventSeq)
+                    .query((rs, rowNum) -> rs.getBytes("raw_payload")).single();
+            if (!existingEventId.equals(eventId) || !java.security.MessageDigest.isEqual(existingPayload, rawPayload)) {
+                quarantinePoisonEvent(rawPayload, "Conflicting event_id for payment/event_seq " + paymentId + "/" + eventSeq);
+            }
             return;
         }
 
         drainContiguousSequenceForPayment(paymentId);
+    }
+
+    private void quarantinePoisonEvent(byte[] rawPayload, String reason) {
+        String hash;
+        try {
+            hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(rawPayload));
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
+        jdbcClient.sql("""
+                INSERT INTO read_model_poison_events (id, payload_sha256, raw_payload, reason, received_at)
+                VALUES (:id, :hash, :payload, :reason, :receivedAt)
+                ON CONFLICT (payload_sha256) DO NOTHING
+                """)
+                .param("id", UUID.randomUUID())
+                .param("hash", hash)
+                .param("payload", rawPayload)
+                .param("reason", reason == null ? "Invalid payment event" : reason)
+                .param("receivedAt", Timestamp.from(clockProvider.now()))
+                .update();
     }
 
     private void drainContiguousSequenceForPayment(UUID paymentId) {
@@ -220,45 +272,69 @@ public class ReadModelProjectorService {
                         .update();
 
                 jdbcClient.sql("""
-                        INSERT INTO merchant_daily_summary (merchant_id, day, captured, refunded, fees, payment_count)
-                        VALUES (:merchantId, :day, :captured, 0, :fees, 1)
-                        ON CONFLICT (merchant_id, day) DO UPDATE
+                        INSERT INTO merchant_daily_summary (merchant_id, day, currency, captured, refunded, fees, payment_count)
+                        VALUES (:merchantId, :day, :currency, :captured, 0, :fees, 1)
+                        ON CONFLICT (merchant_id, day, currency) DO UPDATE
                         SET captured = merchant_daily_summary.captured + EXCLUDED.captured,
                             fees = merchant_daily_summary.fees + EXCLUDED.fees,
                             payment_count = merchant_daily_summary.payment_count + 1
                         """)
                         .param("merchantId", merchantId)
                         .param("day", Date.valueOf(day))
+                        .param("currency", event.getCaptured().getCurrency())
                         .param("captured", capturedAmount)
                         .param("fees", feeAmount)
                         .update();
             }
             case REFUNDED -> {
                 long refundAmount = event.getRefunded().getRefundAmount();
+                long feeReversed = event.getRefunded().getFeeReversedAmount();
                 long totalRefunded = event.getRefunded().getTotalRefundedAmount();
                 jdbcClient.sql("""
                         UPDATE payment_view
-                        SET refunded_amount = :totalRefunded,
+                        SET status = CASE
+                                WHEN :totalRefunded >= captured_amount THEN 'REFUNDED'
+                                ELSE 'PARTIALLY_REFUNDED'
+                            END,
+                            refunded_amount = :totalRefunded,
+                            fee_amount = GREATEST(0, fee_amount - :feeReversed),
                             last_event_seq = :eventSeq,
                             updated_at = :updatedAt
                         WHERE payment_id = :paymentId
                           AND last_event_seq = :eventSeq - 1
                         """)
                         .param("totalRefunded", totalRefunded)
+                        .param("feeReversed", feeReversed)
                         .param("eventSeq", eventSeq)
                         .param("updatedAt", occurredTs)
                         .param("paymentId", paymentId)
                         .update();
 
                 jdbcClient.sql("""
-                        INSERT INTO merchant_daily_summary (merchant_id, day, captured, refunded, fees, payment_count)
-                        VALUES (:merchantId, :day, 0, :refunded, 0, 0)
-                        ON CONFLICT (merchant_id, day) DO UPDATE
-                        SET refunded = merchant_daily_summary.refunded + EXCLUDED.refunded
+                        INSERT INTO merchant_daily_summary (merchant_id, day, currency, captured, refunded, fees, payment_count)
+                        VALUES (:merchantId, :day, :currency, 0, :refunded, :negativeFeeReversal, 0)
+                        ON CONFLICT (merchant_id, day, currency) DO UPDATE
+                        SET refunded = merchant_daily_summary.refunded + EXCLUDED.refunded,
+                            fees = merchant_daily_summary.fees + EXCLUDED.fees
                         """)
                         .param("merchantId", merchantId)
                         .param("day", Date.valueOf(day))
+                        .param("currency", event.getRefunded().getCurrency())
                         .param("refunded", refundAmount)
+                        .param("negativeFeeReversal", -feeReversed)
+                        .update();
+            }
+            case PAYOUT -> {
+                jdbcClient.sql("""
+                        INSERT INTO merchant_daily_summary (merchant_id, day, currency, payout_amount)
+                        VALUES (:merchantId, :day, :currency, :amount)
+                        ON CONFLICT (merchant_id, day, currency) DO UPDATE
+                        SET payout_amount = merchant_daily_summary.payout_amount + EXCLUDED.payout_amount
+                        """)
+                        .param("merchantId", merchantId)
+                        .param("day", Date.valueOf(day))
+                        .param("currency", event.getPayout().getCurrency())
+                        .param("amount", event.getPayout().getAmount())
                         .update();
             }
             default -> {}
@@ -351,49 +427,54 @@ public class ReadModelProjectorService {
 
     @Transactional(readOnly = true)
     public MerchantSummaryResponse getMerchantSummary(UUID merchantId) {
-        record Totals(long totalCaptured, long totalRefunded, long totalFees, long paymentCount) {}
-        Totals totals = jdbcClient.sql("""
+        record Totals(String currency, long captured, long refunded, long fees, long paymentCount) {}
+        Map<String, Totals> paymentTotals = jdbcClient.sql("""
                 SELECT
+                    currency,
                     COALESCE(SUM(captured_amount), 0) AS total_captured,
                     COALESCE(SUM(refunded_amount), 0) AS total_refunded,
                     COALESCE(SUM(fee_amount), 0)      AS total_fees,
-                    COUNT(*)                          AS payment_count
+                    COUNT(*) FILTER (WHERE captured_amount > 0) AS payment_count
                 FROM payment_view
                 WHERE merchant_id = :merchantId
+                GROUP BY currency
                 """)
                 .param("merchantId", merchantId)
                 .query((rs, rowNum) -> new Totals(
-                        rs.getLong("total_captured"),
-                        rs.getLong("total_refunded"),
-                        rs.getLong("total_fees"),
+                        rs.getString("currency"), rs.getLong("total_captured"),
+                        rs.getLong("total_refunded"), rs.getLong("total_fees"),
                         rs.getLong("payment_count")))
-                .single();
+                .list().stream().collect(java.util.stream.Collectors.toMap(Totals::currency, t -> t));
 
         List<DailySummaryRow> daily = jdbcClient.sql("""
-                SELECT merchant_id, day, captured, refunded, fees, payment_count
+                SELECT merchant_id, day, currency, captured, refunded, fees, payout_amount, payment_count
                 FROM merchant_daily_summary
                 WHERE merchant_id = :merchantId
-                ORDER BY day DESC
+                ORDER BY currency, day DESC
                 """)
                 .param("merchantId", merchantId)
                 .query((rs, rowNum) -> new DailySummaryRow(
                         rs.getObject("merchant_id", UUID.class),
                         rs.getDate("day").toLocalDate(),
+                        rs.getString("currency"),
                         rs.getLong("captured"),
                         rs.getLong("refunded"),
                         rs.getLong("fees"),
+                        rs.getLong("payout_amount"),
                         rs.getLong("payment_count")))
                 .list();
 
-        long netPayableFromSales = totals.totalCaptured() - totals.totalFees() - totals.totalRefunded();
-        return new MerchantSummaryResponse(
-                merchantId,
-                totals.totalCaptured(),
-                totals.totalRefunded(),
-                totals.totalFees(),
-                netPayableFromSales,
-                totals.paymentCount(),
-                daily);
+        java.util.Set<String> currencies = new java.util.TreeSet<>(paymentTotals.keySet());
+        daily.forEach(row -> currencies.add(row.currency()));
+        List<CurrencySummary> summaries = currencies.stream().map(currency -> {
+            Totals totals = paymentTotals.getOrDefault(currency, new Totals(currency, 0, 0, 0, 0));
+            List<DailySummaryRow> currencyDaily = daily.stream()
+                    .filter(row -> row.currency().equals(currency)).toList();
+            long payouts = currencyDaily.stream().mapToLong(DailySummaryRow::payoutAmount).sum();
+            return new CurrencySummary(currency, totals.captured(), totals.refunded(), totals.fees(), payouts,
+                    totals.captured() - totals.refunded() - totals.fees() - payouts, totals.paymentCount(), currencyDaily);
+        }).toList();
+        return new MerchantSummaryResponse(merchantId, summaries);
     }
 
     private boolean isAlreadyProcessed(UUID eventId) {
@@ -453,19 +534,24 @@ public class ReadModelProjectorService {
     public record DailySummaryRow(
             UUID merchantId,
             LocalDate day,
+            String currency,
             long captured,
             long refunded,
             long fees,
+            long payoutAmount,
             long paymentCount) {}
 
-    public record MerchantSummaryResponse(
-            UUID merchantId,
+    public record CurrencySummary(
+            String currency,
             long totalCaptured,
             long totalRefunded,
             long totalFees,
+            long totalPayouts,
             long netMerchantAmount,
             long paymentCount,
             List<DailySummaryRow> dailyBreakdown) {}
+
+    public record MerchantSummaryResponse(UUID merchantId, List<CurrencySummary> currencies) {}
 
     public record RebuildReport(
             long eventsProcessed,

@@ -235,9 +235,12 @@ public class LedgerService {
             }
             case REFUND -> {
                 UUID pspAccountId = selectPspReceivableAccountId(txn.paymentId());
-                // Refund policy (Page 9): Debit MERCHANT_PAYABLE, Credit PSP_RECEIVABLE (fee not returned)
-                lines.add(new PostingLine(merchantPayableId, EntryDirection.DEBIT, gross, -gross));
+                // Proportionally reverse fee revenue; merchant bears only the net refund amount.
+                lines.add(new PostingLine(merchantPayableId, EntryDirection.DEBIT, net, -net));
                 lines.add(new PostingLine(pspAccountId, EntryDirection.CREDIT, gross, -gross));
+                if (fee > 0) {
+                    lines.add(new PostingLine(selectFeeAccountId(txn.paymentId()), EntryDirection.DEBIT, fee, -fee));
+                }
             }
             case PAYOUT -> {
                 // Payout (Page 9): Debit MERCHANT_PAYABLE, Credit BANK
@@ -329,7 +332,7 @@ public class LedgerService {
 
     // Package-private query methods used strictly by LedgerController within com.paycore.payments.ledger
 
-    List<LedgerEntryView> findEntriesForPayment(UUID paymentId) {
+    List<LedgerEntryView> findEntriesForPayment(UUID merchantId, UUID paymentId) {
         return jdbcClient.sql("""
                 SELECT
                     le.id AS entry_id,
@@ -344,10 +347,13 @@ public class LedgerService {
                 FROM ledger_entries le
                 JOIN ledger_transactions lt ON lt.id = le.txn_id
                 JOIN accounts a ON a.id = le.account_id
+                JOIN payments p ON p.id = lt.payment_id
                 WHERE lt.payment_id = :paymentId
+                  AND p.merchant_id = :merchantId
                 ORDER BY le.created_at ASC, le.id ASC
                 """)
                 .param("paymentId", paymentId)
+                .param("merchantId", merchantId)
                 .query((rs, rowNum) -> new LedgerEntryView(
                         rs.getObject("entry_id", UUID.class),
                         rs.getObject("txn_id", UUID.class),

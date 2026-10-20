@@ -174,7 +174,14 @@ class LiveRedisAndRedpandaIntegrationTest {
         assertThat(refResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         // 6. Trigger OutboxPollingRelay -> publishes Protobuf PaymentEvent bytes to live Kafka broker
-        int publishedCount = outboxPollingRelay.relayNextBatch();
+        // The relay deliberately exposes only the earliest unpublished event for a payment
+        // per claim batch. Drain successive batches to preserve per-payment ordering.
+        int publishedCount = 0;
+        for (int attempts = 0; attempts < 4; attempts++) {
+            int batchCount = outboxPollingRelay.relayNextBatch();
+            publishedCount += batchCount;
+            if (batchCount == 0) break;
+        }
         assertThat(publishedCount).isEqualTo(3);
 
         Long unpublishedRemaining = jdbcClient.sql("SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL")

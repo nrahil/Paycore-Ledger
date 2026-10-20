@@ -6,11 +6,12 @@ import com.paycore.readmodel.ReadModelProjectorService.PaymentViewRow;
 import com.paycore.readmodel.ReadModelProjectorService.RebuildReport;
 import java.util.Map;
 import java.util.UUID;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -27,26 +28,26 @@ import org.springframework.web.bind.annotation.RestController;
 public class ReadModelController {
 
     private final ReadModelProjectorService projectorService;
+    private final JdbcClient jdbcClient;
 
-    public ReadModelController(ReadModelProjectorService projectorService) {
+    public ReadModelController(ReadModelProjectorService projectorService, JdbcClient jdbcClient) {
         this.projectorService = projectorService;
+        this.jdbcClient = jdbcClient;
     }
 
     @GetMapping("/v1/payments")
     public ResponseEntity<CursorPage<PaymentViewRow>> listPayments(
-            @RequestHeader(value = "X-Merchant-Id", required = false) String headerMerchantId,
-            @RequestParam(value = "merchantId", required = false) UUID queryMerchantId,
+            HttpServletRequest request,
             @RequestParam(value = "cursor", required = false) UUID cursor,
             @RequestParam(value = "limit", defaultValue = "20") int limit) {
-        UUID merchantId = resolveMerchantId(headerMerchantId, queryMerchantId);
+        UUID merchantId = authenticatedMerchantId(request);
         return ResponseEntity.ok(projectorService.listPayments(merchantId, cursor, limit));
     }
 
     @GetMapping("/v1/merchants/me/summary")
     public ResponseEntity<MerchantSummaryResponse> getMerchantSummary(
-            @RequestHeader(value = "X-Merchant-Id", required = false) String headerMerchantId,
-            @RequestParam(value = "merchantId", required = false) UUID queryMerchantId) {
-        UUID merchantId = resolveMerchantId(headerMerchantId, queryMerchantId);
+            HttpServletRequest request) {
+        UUID merchantId = authenticatedMerchantId(request);
         return ResponseEntity.ok(projectorService.getMerchantSummary(merchantId));
     }
 
@@ -68,16 +69,16 @@ public class ReadModelController {
 
     @GetMapping("/readyz")
     public ResponseEntity<Map<String, String>> readyz() {
+        jdbcClient.sql("SELECT 1").query(Integer.class).single();
         return ResponseEntity.ok(Map.of("status", "READY", "service", "read-model-service"));
     }
 
-    private UUID resolveMerchantId(String headerMerchantId, UUID queryMerchantId) {
-        if (headerMerchantId != null && !headerMerchantId.isBlank()) {
-            return UUID.fromString(headerMerchantId.trim());
+    private UUID authenticatedMerchantId(HttpServletRequest request) {
+        UUID merchantId = (UUID) request.getAttribute(ReadModelAccessFilter.MERCHANT_ID_ATTR);
+        if (merchantId == null) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.UNAUTHORIZED, "Authenticated merchant required");
         }
-        if (queryMerchantId != null) {
-            return queryMerchantId;
-        }
-        throw new IllegalArgumentException("Either X-Merchant-Id header or merchantId query param is required");
+        return merchantId;
     }
 }

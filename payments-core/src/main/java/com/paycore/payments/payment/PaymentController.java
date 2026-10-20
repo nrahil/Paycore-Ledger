@@ -74,7 +74,7 @@ public class PaymentController {
     }
 
     /**
-     * Captures an authorized payment and posts balanced 3-leg entries to the double-entry ledger.
+     * Captures an authorized payment through a two-phase PSP/ledger flow.
      */
     @PostMapping("/v1/payments/{id}/capture")
     public ResponseEntity<Payment> capturePayment(
@@ -84,7 +84,7 @@ public class PaymentController {
             @RequestBody(required = false) Map<String, Object> body) {
         Merchant merchant = requireMerchant(httpRequest);
         String path = "/v1/payments/" + paymentId + "/capture";
-        IdempotencyService.IdempotentResult<Payment> result = idempotencyService.execute(
+        IdempotencyService.IdempotentResult<Payment> result = idempotencyService.executeTwoPhase(
                 merchant.id(),
                 idempotencyKey,
                 "POST",
@@ -120,7 +120,7 @@ public class PaymentController {
     }
 
     /**
-     * Atomically executes a partial or full refund protected by pessimistic row locking.
+     * Executes a partial or full refund through a two-phase PSP/ledger flow.
      */
     @PostMapping("/v1/payments/{id}/refunds")
     public ResponseEntity<PaymentService.RefundResponse> refundPayment(
@@ -130,7 +130,7 @@ public class PaymentController {
             @RequestBody PaymentService.RefundRequest body) {
         UUID merchantId = requireMerchantId(httpRequest);
         String path = "/v1/payments/" + paymentId + "/refunds";
-        IdempotencyService.IdempotentResult<PaymentService.RefundResponse> result = idempotencyService.execute(
+        IdempotencyService.IdempotentResult<PaymentService.RefundResponse> result = idempotencyService.executeTwoPhase(
                 merchantId,
                 idempotencyKey,
                 "POST",
