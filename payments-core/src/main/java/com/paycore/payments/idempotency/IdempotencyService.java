@@ -67,7 +67,7 @@ public class IdempotencyService {
     private volatile boolean redisEnabled;
     private final long pollTimeoutMs;
 
-    private final Map<String, CompletableFuture<StoredIdempotencyRecord>> inFlightFutures =
+    private final Map<String, InFlightOperation> inFlightFutures =
             new ConcurrentHashMap<>();
 
     public IdempotencyService(
@@ -172,24 +172,48 @@ public class IdempotencyService {
         }
 
         // 2. Postgres authoritative claim (short independent transaction so concurrent threads see IN_PROGRESS)
-        CompletableFuture<StoredIdempotencyRecord> myFuture = new CompletableFuture<>();
-        inFlightFutures.putIfAbsent(compositeKey, myFuture);
-        ClaimOutcome claim = claimInPostgres(merchantId, trimmedKey, requestHash);
+        InFlightOperation myOperation = new InFlightOperation(requestHash, new CompletableFuture<>());
+        InFlightOperation localPeer = inFlightFutures.putIfAbsent(compositeKey, myOperation);
+        if (localPeer != null) {
+            if (!localPeer.requestHash().equals(requestHash)) {
+                throw PayCoreException.idempotencyPayloadMismatch(trimmedKey);
+            }
+            StoredIdempotencyRecord completed = waitForPeerCompletion(
+                    merchantId, trimmedKey, requestHash, compositeKey, localPeer);
+            return deserializeStoredResult(completed, responseType, true);
+        }
+        CompletableFuture<StoredIdempotencyRecord> myFuture = myOperation.completion();
+        ClaimOutcome claim;
+        try {
+            claim = claimInPostgres(merchantId, trimmedKey, requestHash);
+        } catch (RuntimeException claimFailure) {
+            inFlightFutures.remove(compositeKey, myOperation);
+            myFuture.completeExceptionally(claimFailure);
+            throw claimFailure;
+        }
 
         if (claim.state() == ClaimState.ALREADY_COMPLETED) {
-            inFlightFutures.remove(compositeKey, myFuture);
+            inFlightFutures.remove(compositeKey, myOperation);
             myFuture.complete(claim.record());
             cacheInRedisSafely(merchantId, trimmedKey, claim.record());
             return deserializeStoredResult(claim.record(), responseType, true);
         }
 
         if (claim.state() == ClaimState.IN_PROGRESS_BY_OTHER) {
-            StoredIdempotencyRecord completed = waitForPeerCompletion(merchantId, trimmedKey, requestHash, compositeKey);
-            return deserializeStoredResult(completed, responseType, true);
+            try {
+                StoredIdempotencyRecord completed = waitForPeerCompletion(
+                        merchantId, trimmedKey, requestHash, compositeKey, null);
+                inFlightFutures.remove(compositeKey, myOperation);
+                myFuture.complete(completed);
+                return deserializeStoredResult(completed, responseType, true);
+            } catch (RuntimeException peerWaitFailure) {
+                inFlightFutures.remove(compositeKey, myOperation);
+                myFuture.completeExceptionally(peerWaitFailure);
+                throw peerWaitFailure;
+            }
         }
 
-        // We own the claim (CLAIMED or TAKEN_OVER): register our future for local waiting peers
-        inFlightFutures.put(compositeKey, myFuture);
+        // We own the PostgreSQL claim; local peers can now await this operation without another DB claim.
         try {
             T responseBody;
             if (wrapActionInOuterTx) {
@@ -206,13 +230,13 @@ public class IdempotencyService {
                             public void afterCommit() {
                                 cacheInRedisSafely(merchantId, trimmedKey, completedRecord);
                                 myFuture.complete(completedRecord);
-                                inFlightFutures.remove(compositeKey, myFuture);
+                                inFlightFutures.remove(compositeKey, myOperation);
                             }
                         });
                     } else {
                         cacheInRedisSafely(merchantId, trimmedKey, completedRecord);
                         myFuture.complete(completedRecord);
-                        inFlightFutures.remove(compositeKey, myFuture);
+                        inFlightFutures.remove(compositeKey, myOperation);
                     }
                     return result;
                 });
@@ -224,7 +248,7 @@ public class IdempotencyService {
                         completeClaim(merchantId, trimmedKey, requestHash, successStatusCode, serializedResponse));
                 cacheInRedisSafely(merchantId, trimmedKey, completedRecord);
                 myFuture.complete(completedRecord);
-                inFlightFutures.remove(compositeKey, myFuture);
+                inFlightFutures.remove(compositeKey, myOperation);
                 responseBody = result;
             }
 
@@ -232,7 +256,7 @@ public class IdempotencyService {
         } catch (RuntimeException ex) {
             releaseInProgressClaimSafely(merchantId, trimmedKey);
             myFuture.completeExceptionally(ex);
-            inFlightFutures.remove(compositeKey, myFuture);
+            inFlightFutures.remove(compositeKey, myOperation);
             throw ex;
         }
     }
@@ -359,11 +383,14 @@ public class IdempotencyService {
     }
 
     private StoredIdempotencyRecord waitForPeerCompletion(
-            UUID merchantId, String key, String requestHash, String compositeKey) {
-        CompletableFuture<StoredIdempotencyRecord> localFuture = inFlightFutures.get(compositeKey);
-        if (localFuture != null) {
+            UUID merchantId,
+            String key,
+            String requestHash,
+            String compositeKey,
+            InFlightOperation localOperation) {
+        if (localOperation != null) {
             try {
-                StoredIdempotencyRecord rec = localFuture.get(pollTimeoutMs, TimeUnit.MILLISECONDS);
+                StoredIdempotencyRecord rec = localOperation.completion().get(pollTimeoutMs, TimeUnit.MILLISECONDS);
                 if (!rec.requestHash().equals(requestHash)) {
                     throw PayCoreException.idempotencyPayloadMismatch(key);
                 }
@@ -485,6 +512,8 @@ public class IdempotencyService {
     }
 
     private record ClaimOutcome(ClaimState state, StoredIdempotencyRecord record) {}
+
+    private record InFlightOperation(String requestHash, CompletableFuture<StoredIdempotencyRecord> completion) {}
 
     public record StoredIdempotencyRecord(
             UUID merchantId,

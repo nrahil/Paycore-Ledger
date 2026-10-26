@@ -9,8 +9,6 @@ import com.paycore.common.ids.UuidV7;
 import com.paycore.common.tracing.TraceHeaders;
 import com.paycore.webhook.WebhookDeliveryService.DeliveryOutcome;
 import com.paycore.webhook.WebhookDeliveryService.DeliveryStatus;
-import com.paycore.webhook.WebhookDeliveryService.DlqEventRow;
-import com.paycore.webhook.WebhookDeliveryService.WebhookDeliveryRow;
 import com.sun.net.httpserver.HttpServer;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -113,6 +111,12 @@ class WebhookServiceIntegrationTest {
     private WebhookDeliveryService deliveryService;
 
     @Autowired
+    private WebhookRetryCoordinator retryCoordinator;
+
+    @Autowired
+    private WebhookQueryService queryService;
+
+    @Autowired
     private JdbcClient jdbcClient;
 
     @Autowired
@@ -171,7 +175,7 @@ class WebhookServiceIntegrationTest {
             assertThat(dup.status()).isEqualTo(DeliveryStatus.DUPLICATE_IGNORED);
         }
 
-        List<WebhookDeliveryRow> rows = deliveryService.listDeliveries(merchantId);
+        List<WebhookViews.DeliveryRow> rows = queryService.listDeliveries(merchantId);
         assertThat(rows).hasSize(1);
         assertThat(rows.get(0).status()).isEqualTo("DELIVERED");
         assertThat(receivedWebhooks).hasSize(1);
@@ -203,7 +207,7 @@ class WebhookServiceIntegrationTest {
                 UuidV7.generate(), UuidV7.generate(), merchantWithoutEndpoint, 2L, 1_500L, 43L));
 
         assertThat(outcome.status()).isEqualTo(DeliveryStatus.DEAD_LETTERED);
-        assertThat(deliveryService.listDlqEvents())
+        assertThat(queryService.listDlqEvents())
                 .anySatisfy(dlq -> assertThat(dlq.reason()).isEqualTo("MISSING_WEBHOOK_ENDPOINT"));
     }
 
@@ -223,12 +227,12 @@ class WebhookServiceIntegrationTest {
         Instant futureAsOf = Instant.now();
         for (int round = 1; round <= 5; round++) {
             futureAsOf = futureAsOf.plus(Duration.ofHours(7));
-            deliveryService.processDueRetries(futureAsOf);
+            retryCoordinator.processDueRetries(futureAsOf);
         }
 
         assertThat(receivedWebhooks).hasSize(10);
-        assertThat(deliveryService.getConsumerLagStats().processedEventsTotal()).isEqualTo(10L);
-        assertThat(deliveryService.getConsumerLagStats().pendingRetries()).isEqualTo(0L);
+        assertThat(queryService.getConsumerLagStats().processedEventsTotal()).isEqualTo(10L);
+        assertThat(queryService.getConsumerLagStats().pendingRetries()).isEqualTo(0L);
     }
 
     @Test
@@ -251,18 +255,18 @@ class WebhookServiceIntegrationTest {
         Instant future = Instant.now();
         for (int tier = 1; tier <= WebhookDeliveryService.RETRY_TOPICS.size(); tier++) {
             future = future.plus(Duration.ofHours(8));
-            int processed = deliveryService.processDueRetries(future);
+            int processed = retryCoordinator.processDueRetries(future);
             assertThat(processed).isEqualTo(1);
         }
 
-        List<DlqEventRow> dlqEvents = deliveryService.listDlqEvents();
+        List<WebhookViews.DlqEventRow> dlqEvents = queryService.listDlqEvents();
         assertThat(dlqEvents).hasSize(2); // 1 poison + 1 exhausted retries
 
         // Merchant fixes their webhook server (returns 200 OK now)
         merchantResponseStatus.set(200);
 
         // Operator triggers POST /v1/admin/webhooks/{id}/replay on the latest delivery row
-        UUID latestDeliveryId = deliveryService.listDeliveries(merchantId).get(0).id();
+        UUID latestDeliveryId = queryService.listDeliveries(merchantId).get(0).id();
         org.springframework.http.HttpHeaders adminHeaders = new org.springframework.http.HttpHeaders();
         adminHeaders.set("X-PayCore-Admin-Token", "webhook-test-admin");
         ResponseEntity<DeliveryOutcome> replayResp = restTemplate.exchange(
@@ -286,7 +290,7 @@ class WebhookServiceIntegrationTest {
                 buildCapturedEvent(eventId, paymentId, merchantId, 2L, 9_000L, 261L));
 
         assertThat(outcome.status()).isEqualTo(DeliveryStatus.RETRY_SCHEDULED);
-        WebhookDeliveryRow row = deliveryService.listDeliveries(merchantId).get(0);
+        WebhookViews.DeliveryRow row = queryService.listDeliveries(merchantId).get(0);
         assertThat(row.attempt()).isEqualTo(1);
         assertThat(row.lastError()).contains("private, loopback, or link-local");
         assertThat(receivedWebhooks).isEmpty();

@@ -1,0 +1,61 @@
+{
+  "scenario": "local_payment_flow",
+  "capturedAt": "2026-10-23",
+  "executor": "constant-vus",
+  "virtualUsers": 10,
+  "durationSeconds": 120,
+  "flow": ["create", "authorize", "capture"],
+  "completedPaymentFlows": 4241,
+  "paymentFlowsPerSecond": 35.28095,
+  "httpRequests": 12723,
+  "httpRequestsPerSecond": 105.84285,
+  "checks": {
+    "passed": 12723,
+    "failed": 0,
+    "result": "passed"
+  },
+  "httpRequestFailures": 0,
+  "captureRequestLatencyMs": {
+    "p50": 140.51,
+    "p95": 330.81,
+    "average": 168.61,
+    "maximum": 2724.94,
+    "p95ThresholdMs": 2000,
+    "thresholdResult": "passed"
+  },
+  "paymentCoreHttpLatencyMs": {
+    "average": 93.80,
+    "p95": 232.48
+  },
+  "ledgerInvariantCheck": {
+    "status": "PASS",
+    "globalDebitsMinorUnits": 4751000,
+    "globalCreditsMinorUnits": 4751000,
+    "globalImbalanceMinorUnits": 0,
+    "unbalancedTransactions": 0,
+    "negativeMerchantAccounts": 0,
+    "mismatchedBalanceAccounts": 0,
+    "ledgerDriftMinorUnits": 0
+  },
+  "prometheusCrossCheck": {
+    "paymentsCoreCreates": 4241,
+    "paymentsCoreAuthorizations": 4241,
+    "paymentsCoreCaptures": 4241,
+    "mockPspAuthorizations": 4241,
+    "mockPspCaptures": 4241,
+    "ledgerDriftGaugeMinorUnits": 0,
+    "applicationTargetsUp": ["gateway", "payments-core", "mock-psp"],
+    "applicationTargetsDown": ["webhook-service", "read-model-service", "reconciliation"]
+  },
+  "environment": {
+    "host": "Windows laptop",
+    "cpu": "12th Gen Intel Core i5-12500H",
+    "hostRamGb": 15.7,
+    "java": "21.0.12.1",
+    "docker": "28.4.0",
+    "k6": "v2.3.0",
+    "k6ImageDigest": "sha256:e66db15b860113878fa74670e31f5e274830b7b6e42c8bff28b2f2d86a257603",
+    "runtime": "Docker Compose local infrastructure; gateway, payments-core, and mock PSP application services",
+    "scope": "Local payment write-path load test; not a production capacity benchmark. Refunds, webhooks, and consumer lag were not exercised."
+  }
+}

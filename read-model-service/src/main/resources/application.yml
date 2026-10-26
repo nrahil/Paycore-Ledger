@@ -39,6 +39,9 @@ spring:
     baseline-version: 0
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
     consumer:
       group-id: read-model-service-group
       auto-offset-reset: earliest
@@ -51,3 +54,4 @@ paycore:
     internal-token: ${PAYCORE_INTERNAL_TOKEN:}
   readmodel:
     kafka-listener-enabled: ${PAYCORE_READMODEL_KAFKA_LISTENER_ENABLED:false}
+    dead-letter-topic: ${PAYCORE_READMODEL_DLT_TOPIC:payments.events.DLT}

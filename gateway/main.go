@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,16 +40,10 @@ type GatewayConfig struct {
 	UpstreamTimeout   time.Duration
 }
 
-type tokenBucket struct {
-	mu         sync.Mutex
-	tokens     float64
-	lastRefill time.Time
-}
-
 // Gateway implements the PayCore Edge Gateway (Section 1.2 Stretch 4 & Section 4.1).
 type Gateway struct {
 	cfg             GatewayConfig
-	buckets         sync.Map
+	rateLimiter     *rateLimiter
 	paymentsProxy   *httputil.ReverseProxy
 	webhookProxy    *httputil.ReverseProxy
 	readModelProxy  *httputil.ReverseProxy
@@ -107,34 +99,18 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		webhookProxy:   webhookProxy,
 		readModelProxy: readModelProxy,
 		reconProxy:     reconProxy,
+		rateLimiter:    newRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst),
 	}
 	go gw.startBucketEvictionLoop(5 * time.Minute)
 	return gw, nil
 }
 
 func (g *Gateway) startBucketEvictionLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for now := range ticker.C {
-		g.evictStaleBuckets(now)
-	}
+	g.rateLimiter.startBucketEvictionLoop(interval)
 }
 
 func (g *Gateway) evictStaleBuckets(now time.Time) int {
-	idleTTLSeconds := math.Max(60.0, 10.0*float64(g.cfg.RateLimitBurst)/g.cfg.RateLimitRPS)
-	evicted := 0
-	g.buckets.Range(func(key, value any) bool {
-		b := value.(*tokenBucket)
-		b.mu.Lock()
-		idleSec := now.Sub(b.lastRefill).Seconds()
-		b.mu.Unlock()
-		if idleSec > idleTTLSeconds {
-			g.buckets.Delete(key)
-			evicted++
-		}
-		return true
-	})
-	return evicted
+	return g.rateLimiter.evictStaleBuckets(now)
 }
 
 func newReverseProxy(rawURL string, timeout time.Duration) (*httputil.ReverseProxy, error) {
@@ -220,7 +196,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rateKey == "" {
 		rateKey = r.RemoteAddr
 	}
-	allowed, remaining, retryAfterSec := g.allowRequest(rateKey)
+	allowed, remaining, retryAfterSec := g.rateLimiter.allow(rateKey)
 	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(g.cfg.RateLimitBurst))
 	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 	if !allowed {
@@ -254,82 +230,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), g.cfg.UpstreamTimeout)
 	defer cancel()
 	targetProxy.ServeHTTP(w, r.WithContext(ctx))
-}
-
-func (g *Gateway) selectUpstreamProxy(method, path string) *httputil.ReverseProxy {
-	// CQRS Read Model routes
-	if (method == http.MethodGet && path == "/v1/payments") ||
-		path == "/v1/merchants/me/summary" ||
-		strings.HasPrefix(path, "/v1/admin/read-model") {
-		return g.readModelProxy
-	}
-	// Webhook Service routes
-	if strings.HasPrefix(path, "/v1/webhook-") ||
-		strings.HasPrefix(path, "/v1/admin/webhooks") ||
-		strings.HasPrefix(path, "/v1/admin/dlq") ||
-		strings.HasPrefix(path, "/v1/admin/consumers") {
-		return g.webhookProxy
-	}
-	// Reconciliation Service routes
-	if strings.HasPrefix(path, "/v1/admin/reconciliation") {
-		return g.reconProxy
-	}
-	// Default: Authoritative Payments Core & Ledger Service
-	return g.paymentsProxy
-}
-
-func (g *Gateway) allowRequest(key string) (bool, int, int) {
-	now := time.Now()
-	val, _ := g.buckets.LoadOrStore(key, &tokenBucket{
-		tokens:     float64(g.cfg.RateLimitBurst),
-		lastRefill: now,
-	})
-	b := val.(*tokenBucket)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	elapsed := now.Sub(b.lastRefill).Seconds()
-	if elapsed > 0 {
-		b.tokens = math.Min(float64(g.cfg.RateLimitBurst), b.tokens+elapsed*g.cfg.RateLimitRPS)
-		b.lastRefill = now
-	}
-
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
-		return true, int(math.Floor(b.tokens)), 0
-	}
-
-	deficit := 1.0 - b.tokens
-	retrySec := int(math.Ceil(deficit / g.cfg.RateLimitRPS))
-	if retrySec < 1 {
-		retrySec = 1
-	}
-	return false, 0, retrySec
-}
-
-func requiresMerchantAuth(method, path string) bool {
-	if path == "/v1/merchants" && method == http.MethodPost {
-		return false
-	}
-	if strings.HasPrefix(path, "/v1/admin/") {
-		return false
-	}
-	return strings.HasPrefix(path, "/v1/payments") ||
-		strings.HasPrefix(path, "/v1/payouts") ||
-		strings.HasPrefix(path, "/v1/merchants/me")
-}
-
-func requiresIdempotencyKey(method, path string) bool {
-	if method != http.MethodPost {
-		return false
-	}
-	return path == "/v1/payments" ||
-		path == "/v1/payouts" ||
-		(strings.HasPrefix(path, "/v1/payments/") &&
-			(strings.HasSuffix(path, "/authorize") ||
-				strings.HasSuffix(path, "/capture") ||
-				strings.HasSuffix(path, "/void") ||
-				strings.HasSuffix(path, "/refunds")))
 }
 
 func generateTraceparent() string {

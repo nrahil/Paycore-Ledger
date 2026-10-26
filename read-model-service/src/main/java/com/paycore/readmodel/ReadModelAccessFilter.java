@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import com.paycore.common.security.ServiceTokenValidator;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -74,8 +75,7 @@ public class ReadModelAccessFilter extends OncePerRequestFilter {
     }
 
     private static boolean authorized(String expected, String actual) {
-        return !expected.isEmpty() && actual != null && MessageDigest.isEqual(
-                expected.getBytes(StandardCharsets.UTF_8), actual.trim().getBytes(StandardCharsets.UTF_8));
+        return ServiceTokenValidator.matches(expected, actual);
     }
 
     private static String sha256Hex(String value) {

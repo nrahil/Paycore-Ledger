@@ -26,10 +26,18 @@ import org.springframework.web.bind.annotation.RestController;
 public class WebhookController {
 
     private final WebhookDeliveryService webhookService;
+    private final WebhookReplayService replayService;
+    private final WebhookQueryService queryService;
     private final JdbcClient jdbcClient;
 
-    public WebhookController(WebhookDeliveryService webhookService, JdbcClient jdbcClient) {
+    public WebhookController(
+            WebhookDeliveryService webhookService,
+            WebhookReplayService replayService,
+            WebhookQueryService queryService,
+            JdbcClient jdbcClient) {
         this.webhookService = webhookService;
+        this.replayService = replayService;
+        this.queryService = queryService;
         this.jdbcClient = jdbcClient;
     }
 
@@ -47,7 +55,7 @@ public class WebhookController {
     }
 
     @GetMapping("/v1/webhook-deliveries")
-    public ResponseEntity<List<WebhookDeliveryService.WebhookDeliveryRow>> listDeliveries(
+    public ResponseEntity<List<WebhookViews.DeliveryRow>> listDeliveries(
             HttpServletRequest httpRequest,
             @RequestParam(value = "merchantId", required = false) UUID merchantId) {
         UUID authenticatedMerchantId = requireMerchantId(httpRequest);
@@ -55,37 +63,37 @@ public class WebhookController {
             throw new org.springframework.web.server.ResponseStatusException(
                     HttpStatus.FORBIDDEN, "Cannot access another merchant's deliveries");
         }
-        return ResponseEntity.ok(webhookService.listDeliveries(authenticatedMerchantId));
+        return ResponseEntity.ok(queryService.listDeliveries(authenticatedMerchantId));
     }
 
     @PostMapping("/v1/webhook-deliveries/{id}/replay")
     public ResponseEntity<WebhookDeliveryService.DeliveryOutcome> replayDelivery(
             HttpServletRequest request,
             @PathVariable("id") UUID deliveryId) {
-        return ResponseEntity.ok(webhookService.replayDeliveryForMerchant(
+        return ResponseEntity.ok(replayService.replayDeliveryForMerchant(
                 requireMerchantId(request), deliveryId));
     }
 
     @PostMapping("/v1/admin/webhooks/{id}/replay")
     public ResponseEntity<WebhookDeliveryService.DeliveryOutcome> replayDeliveryAsAdmin(
             @PathVariable("id") UUID deliveryId) {
-        return ResponseEntity.ok(webhookService.replayDelivery(deliveryId));
+        return ResponseEntity.ok(replayService.replayDelivery(deliveryId));
     }
 
     @GetMapping("/v1/admin/dlq")
-    public ResponseEntity<List<WebhookDeliveryService.DlqEventRow>> listDlq() {
-        return ResponseEntity.ok(webhookService.listDlqEvents());
+    public ResponseEntity<List<WebhookViews.DlqEventRow>> listDlq() {
+        return ResponseEntity.ok(queryService.listDlqEvents());
     }
 
     @PostMapping("/v1/admin/dlq/{id}/replay")
-    public ResponseEntity<WebhookDeliveryService.DlqEventRow> replayDlq(
+    public ResponseEntity<WebhookViews.DlqEventRow> replayDlq(
             @PathVariable("id") UUID dlqId) {
-        return ResponseEntity.ok(webhookService.replayDlqEvent(dlqId));
+        return ResponseEntity.ok(replayService.replayDlqEvent(dlqId));
     }
 
     @GetMapping("/v1/admin/consumers/lag")
-    public ResponseEntity<WebhookDeliveryService.ConsumerLagView> getConsumerLag() {
-        return ResponseEntity.ok(webhookService.getConsumerLagStats());
+    public ResponseEntity<WebhookViews.ConsumerLagView> getConsumerLag() {
+        return ResponseEntity.ok(queryService.getConsumerLagStats());
     }
 
     @GetMapping("/healthz")

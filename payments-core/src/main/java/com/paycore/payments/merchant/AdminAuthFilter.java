@@ -5,8 +5,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import com.paycore.common.security.ServiceTokenValidator;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -44,9 +43,7 @@ public class AdminAuthFilter extends OncePerRequestFilter {
         }
 
         String suppliedToken = request.getHeader(ADMIN_TOKEN_HEADER);
-        if (suppliedToken == null || !MessageDigest.isEqual(
-                configuredToken.getBytes(StandardCharsets.UTF_8),
-                suppliedToken.trim().getBytes(StandardCharsets.UTF_8))) {
+        if (!ServiceTokenValidator.matches(configuredToken, suppliedToken)) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             return;
         }

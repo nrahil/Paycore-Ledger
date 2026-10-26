@@ -5,8 +5,8 @@ export const options = {
   scenarios: {
     local_payment_flow: {
       executor: 'constant-vus',
-      vus: 2,
-      duration: '30s',
+      vus: Number(__ENV.PAYCORE_K6_VUS || 2),
+      duration: __ENV.PAYCORE_K6_DURATION || '30s',
       gracefulStop: '5s',
     },
   },

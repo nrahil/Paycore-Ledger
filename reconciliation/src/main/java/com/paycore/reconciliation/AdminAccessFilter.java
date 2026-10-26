@@ -5,8 +5,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import com.paycore.common.security.ServiceTokenValidator;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -34,8 +33,7 @@ public class AdminAccessFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         String supplied = request.getHeader("X-PayCore-Admin-Token");
-        boolean valid = !adminToken.isEmpty() && supplied != null && MessageDigest.isEqual(
-                adminToken.getBytes(StandardCharsets.UTF_8), supplied.trim().getBytes(StandardCharsets.UTF_8));
+        boolean valid = ServiceTokenValidator.matches(adminToken, supplied);
         if (!valid) {
             response.setStatus(adminToken.isEmpty() ? 503 : 401);
             return;

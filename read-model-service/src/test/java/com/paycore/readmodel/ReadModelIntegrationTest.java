@@ -9,17 +9,18 @@ import com.paycore.common.events.v1.PaymentEvent;
 import com.paycore.common.events.v1.PayoutCreated;
 import com.paycore.common.events.v1.RefundProcessed;
 import com.paycore.common.ids.UuidV7;
-import com.paycore.readmodel.ReadModelProjectorService.CursorPage;
-import com.paycore.readmodel.ReadModelProjectorService.MerchantSummaryResponse;
-import com.paycore.readmodel.ReadModelProjectorService.PaymentViewRow;
-import com.paycore.readmodel.ReadModelProjectorService.RebuildReport;
 import java.time.Instant;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
+import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,11 +34,18 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Testcontainers
@@ -62,17 +70,29 @@ class ReadModelIntegrationTest {
     private ReadModelProjectorService projectorService;
 
     @Autowired
+    private ReadModelQueryService queryService;
+
+    @Autowired
+    private ReadModelRebuildService rebuildService;
+
+    @Autowired
+    private ReadModelDeadLetterService deadLetterService;
+
+    @Autowired
     private JdbcClient jdbcClient;
 
     @Autowired
     private TestRestTemplate restTemplate;
+
+    @MockBean
+    private KafkaTemplate<String, byte[]> kafkaTemplate;
 
     private UUID merchantId;
     private String merchantApiKey;
 
     @BeforeEach
     void setUp() {
-        jdbcClient.sql("TRUNCATE TABLE payment_view, merchant_daily_summary, processed_events, read_model_event_log, read_model_poison_events")
+        jdbcClient.sql("TRUNCATE TABLE payment_view, merchant_daily_summary, processed_events, read_model_event_log, read_model_poison_events, read_model_dead_letters")
                 .update();
         merchantId = UuidV7.generate();
         jdbcClient.sql("CREATE TABLE IF NOT EXISTS merchants (id UUID PRIMARY KEY, api_key_hash VARCHAR(64) NOT NULL UNIQUE)")
@@ -95,6 +115,50 @@ class ReadModelIntegrationTest {
         Long quarantined = jdbcClient.sql("SELECT COUNT(*) FROM read_model_poison_events")
                 .query(Long.class).single();
         assertThat(quarantined).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("Dead-letter replay republishes the original key and closes the aggregate sequence gap")
+    void deadLetterReplayRequeuesTheOriginalEventAndDrainsItsGap() {
+        UUID paymentId = UuidV7.generate();
+        Instant now = Instant.parse("2026-10-11T10:00:00Z");
+        byte[] sequenceOne = buildAuthorizedEvent(
+                UuidV7.generate(), paymentId, merchantId, 1L, 10_000L, "psp-dlt-replay", now);
+        byte[] sequenceTwo = buildCapturedEvent(
+                UuidV7.generate(), paymentId, merchantId, 2L, 10_000L, 290L, now.plusSeconds(1));
+
+        // The later event can be buffered while sequence one awaits repair and replay.
+        projectorService.ingestEvent(sequenceTwo);
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(KafkaHeaders.DLT_ORIGINAL_TOPIC, "payments.events".getBytes(StandardCharsets.UTF_8));
+        headers.add(KafkaHeaders.DLT_ORIGINAL_PARTITION, ByteBuffer.allocate(Integer.BYTES).putInt(0).array());
+        headers.add(KafkaHeaders.DLT_ORIGINAL_OFFSET, ByteBuffer.allocate(Long.BYTES).putLong(41L).array());
+        headers.add(KafkaHeaders.DLT_EXCEPTION_FQCN,
+                IllegalStateException.class.getName().getBytes(StandardCharsets.UTF_8));
+        headers.add(KafkaHeaders.DLT_EXCEPTION_MESSAGE,
+                "temporary projection failure".getBytes(StandardCharsets.UTF_8));
+        ConsumerRecord<String, byte[]> deadLetter = new ConsumerRecord<>(
+                "payments.events.DLT", 0, 12L, paymentId.toString(), sequenceOne);
+        headers.forEach(deadLetter.headers()::add);
+        deadLetterService.recordDeadLetter(deadLetter);
+        deadLetterService.recordDeadLetter(deadLetter);
+        assertThat(jdbcClient.sql("SELECT COUNT(*) FROM read_model_dead_letters")
+                .query(Long.class).single()).isEqualTo(1L);
+
+        when(kafkaTemplate.send(eq("payments.events"), eq(paymentId.toString()), any(byte[].class)))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        ReadModelViews.DeadLetterView listed = deadLetterService.listDeadLetters(10).get(0);
+        ReadModelViews.DeadLetterReplayResult replay = deadLetterService.replay(listed.id());
+
+        assertThat(replay.sourceTopic()).isEqualTo("payments.events");
+        assertThat(replay.replayCount()).isEqualTo(1);
+        verify(kafkaTemplate).send(eq("payments.events"), eq(paymentId.toString()), eq(sequenceOne));
+
+        // Emulate the source consumer receiving the republished event. The projector drains seq 1 then seq 2.
+        projectorService.ingestEvent(sequenceOne);
+        ReadModelViews.PaymentViewRow payment = queryService.listPayments(merchantId, null, 10).items().get(0);
+        assertThat(payment.status()).isEqualTo("CAPTURED");
+        assertThat(payment.lastEventSeq()).isEqualTo(2L);
     }
 
     @Test
@@ -136,7 +200,7 @@ class ReadModelIntegrationTest {
                         .setCurrency("USD").setPspRef("psp-usd").setLedgerTxnId(UuidV7.generate().toString()))
                 .build().toByteArray());
 
-        MerchantSummaryResponse before = projectorService.getMerchantSummary(merchantId);
+        ReadModelViews.MerchantSummaryResponse before = queryService.getMerchantSummary(merchantId);
         assertThat(before.currencies()).hasSize(2);
         assertThat(before.currencies()).filteredOn(summary -> summary.currency().equals("INR"))
                 .singleElement().satisfies(summary -> {
@@ -151,8 +215,37 @@ class ReadModelIntegrationTest {
                     assertThat(summary.totalPayouts()).isZero();
                 });
 
-        projectorService.rebuildFromScratch();
-        assertThat(projectorService.getMerchantSummary(merchantId)).isEqualTo(before);
+        rebuildService.rebuildFromScratch();
+        assertThat(queryService.getMerchantSummary(merchantId)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("Unknown event payloads preserve aggregate sequence continuity")
+    void unknownPayloadAdvancesProjectionSequenceForLaterKnownEvents() {
+        UUID paymentId = UuidV7.generate();
+        Instant now = Instant.parse("2026-10-11T10:00:00Z");
+        byte[] knownFields = PaymentEvent.newBuilder()
+                .setEventId(UuidV7.generate().toString())
+                .setPaymentId(paymentId.toString())
+                .setMerchantId(merchantId.toString())
+                .setEventSeq(1)
+                .setEventType("future.payment.event")
+                .build()
+                .toByteArray();
+        byte[] unknownPayload = Arrays.copyOf(knownFields, knownFields.length + 3);
+        unknownPayload[knownFields.length] = 0x7A; // Unknown field 15, length-delimited.
+        unknownPayload[knownFields.length + 1] = 0x01;
+        unknownPayload[knownFields.length + 2] = 0x01;
+
+        projectorService.ingestEvent(unknownPayload);
+        projectorService.ingestEvent(buildAuthorizedEvent(
+                UuidV7.generate(), paymentId, merchantId, 2L, 2_000L, "psp-after-unknown", now.plusSeconds(1)));
+
+        ReadModelViews.PaymentViewRow projection = queryService.listPayments(merchantId, null, 10).items().get(0);
+        assertThat(projection.status()).isEqualTo("AUTHORIZED");
+        assertThat(projection.lastEventSeq()).isEqualTo(2L);
+        assertThat(jdbcClient.sql("SELECT COUNT(*) FROM read_model_poison_events")
+                .query(Long.class).single()).isZero();
     }
 
     @Test
@@ -186,20 +279,20 @@ class ReadModelIntegrationTest {
 
         // 1. Deliver seq 3 first (out-of-order gap: missing seq 1 and seq 2)
         projectorService.ingestEvent(seq3Refund1);
-        assertThat(projectorService.listPayments(merchantId, null, 10).items()).isEmpty();
+        assertThat(queryService.listPayments(merchantId, null, 10).items()).isEmpty();
 
         // 2. Deliver seq 2 next (still missing seq 1)
         projectorService.ingestEvent(seq2Captured);
         // Also deliver duplicate seq 2
         projectorService.ingestEvent(seq2Captured);
-        assertThat(projectorService.listPayments(merchantId, null, 10).items()).isEmpty();
+        assertThat(queryService.listPayments(merchantId, null, 10).items()).isEmpty();
 
         // 3. Deliver seq 1 -> gap is filled! Must automatically drain seq 1 -> seq 2 -> seq 3!
         projectorService.ingestEvent(seq1Authorized);
 
-        List<PaymentViewRow> rowsAfterDrain = projectorService.listPayments(merchantId, null, 10).items();
+        List<ReadModelViews.PaymentViewRow> rowsAfterDrain = queryService.listPayments(merchantId, null, 10).items();
         assertThat(rowsAfterDrain).hasSize(1);
-        PaymentViewRow view = rowsAfterDrain.get(0);
+        ReadModelViews.PaymentViewRow view = rowsAfterDrain.get(0);
         assertThat(view.status()).isEqualTo("PARTIALLY_REFUNDED");
         assertThat(view.amount()).isEqualTo(10_000L);
         assertThat(view.capturedAmount()).isEqualTo(10_000L);
@@ -209,15 +302,15 @@ class ReadModelIntegrationTest {
 
         // 4. Deliver seq 4 and duplicate seq 1 + seq 3
         projectorService.ingestEvent(seq4Refund2);
-        assertThat(projectorService.listPayments(merchantId, null, 10).items().get(0).status())
+        assertThat(queryService.listPayments(merchantId, null, 10).items().get(0).status())
                 .isEqualTo("PARTIALLY_REFUNDED");
         projectorService.ingestEvent(seq5FinalRefund);
-        assertThat(projectorService.listPayments(merchantId, null, 10).items().get(0).status())
+        assertThat(queryService.listPayments(merchantId, null, 10).items().get(0).status())
                 .isEqualTo("REFUNDED");
         projectorService.ingestEvent(seq1Authorized);
         projectorService.ingestEvent(seq3Refund1);
 
-        MerchantSummaryResponse summary = projectorService.getMerchantSummary(merchantId);
+        ReadModelViews.MerchantSummaryResponse summary = queryService.getMerchantSummary(merchantId);
         assertThat(summary.currencies()).singleElement().satisfies(currency -> {
             assertThat(currency.currency()).isEqualTo("INR");
             assertThat(currency.totalCaptured()).isEqualTo(10_000L);
@@ -255,13 +348,13 @@ class ReadModelIntegrationTest {
             String url = "/v1/payments?limit=5" + (cursor != null ? "&cursor=" + cursor : "");
             HttpHeaders headers = new HttpHeaders();
             headers.set("X-API-Key", merchantApiKey);
-            ResponseEntity<CursorPage<PaymentViewRow>> pageResp = restTemplate.exchange(
+            ResponseEntity<ReadModelViews.CursorPage<ReadModelViews.PaymentViewRow>> pageResp = restTemplate.exchange(
                     url,
                     HttpMethod.GET,
                     new HttpEntity<>(headers),
                     new ParameterizedTypeReference<>() {});
             assertThat(pageResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-            CursorPage<PaymentViewRow> page = pageResp.getBody();
+            ReadModelViews.CursorPage<ReadModelViews.PaymentViewRow> page = pageResp.getBody();
             assertThat(page).isNotNull();
             page.items().forEach(r -> collectedIds.add(r.paymentId()));
             pages++;
@@ -275,22 +368,22 @@ class ReadModelIntegrationTest {
         assertThat(collectedIds).hasSize(15).doesNotHaveDuplicates();
 
         // Capture live summary before rebuild
-        MerchantSummaryResponse beforeRebuild = projectorService.getMerchantSummary(merchantId);
+        ReadModelViews.MerchantSummaryResponse beforeRebuild = queryService.getMerchantSummary(merchantId);
 
         // Trigger POST /v1/admin/read-model/rebuild (truncates projection tables and replays from offset 0)
         HttpHeaders adminHeaders = new HttpHeaders();
         adminHeaders.set("X-PayCore-Admin-Token", "readmodel-test-admin");
-        ResponseEntity<RebuildReport> rebuildResp = restTemplate.exchange(
+        ResponseEntity<ReadModelViews.RebuildReport> rebuildResp = restTemplate.exchange(
                 "/v1/admin/read-model/rebuild", HttpMethod.POST,
-                new HttpEntity<>(null, adminHeaders), RebuildReport.class);
+                new HttpEntity<>(null, adminHeaders), ReadModelViews.RebuildReport.class);
         assertThat(rebuildResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        RebuildReport report = rebuildResp.getBody();
+        ReadModelViews.RebuildReport report = rebuildResp.getBody();
         assertThat(report).isNotNull();
         assertThat(report.paymentsProjected()).isEqualTo(15L);
         assertThat(report.eventsProcessed()).isEqualTo(35L); // 15 auth + 15 capture + 5 refunds
 
         // Verify post-rebuild summary matches pre-rebuild summary paise-for-paise
-        MerchantSummaryResponse afterRebuild = projectorService.getMerchantSummary(merchantId);
+        ReadModelViews.MerchantSummaryResponse afterRebuild = queryService.getMerchantSummary(merchantId);
         assertThat(afterRebuild).isEqualTo(beforeRebuild);
     }
 

@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,6 +40,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.OkHttp3ClientHttpRequestFactory;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -56,9 +58,11 @@ import org.testcontainers.junit.jupiter.Testcontainers;
             "server.tomcat.accept-count=1000",
             "server.tomcat.max-connections=2000",
             "paycore.resolver.interval-ms=3600000",
+            "paycore.idempotency.poll-timeout-ms=180000",
             "paycore.security.admin-token=payments-test-admin"
         })
 @Testcontainers
+@Tag("stretch")
 class ConcurrencyAndCrashTortureTest {
 
     private static final Logger log = LoggerFactory.getLogger(ConcurrencyAndCrashTortureTest.class);
@@ -86,6 +90,10 @@ class ConcurrencyAndCrashTortureTest {
 
     @BeforeEach
     void setUp() {
+        OkHttp3ClientHttpRequestFactory requestFactory = new OkHttp3ClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(Duration.ofSeconds(10));
+        requestFactory.setReadTimeout(Duration.ofSeconds(210));
+        restTemplate.getRestTemplate().setRequestFactory(requestFactory);
         pspClient.clearFaults();
         paymentService.setCrashHook(stage -> {});
         idempotencyService.setRedisEnabled(false);

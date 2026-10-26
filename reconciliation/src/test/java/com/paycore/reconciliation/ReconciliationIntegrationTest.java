@@ -5,9 +5,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.paycore.common.ids.UuidV7;
 import com.paycore.reconciliation.ReconciliationController.ReconciliationRequest;
-import com.paycore.reconciliation.ReconciliationService.DiscrepancyKind;
-import com.paycore.reconciliation.ReconciliationService.DiscrepancyRecord;
-import com.paycore.reconciliation.ReconciliationService.ReconRunReport;
+import com.paycore.reconciliation.ReconciliationModels.DiscrepancyKind;
+import com.paycore.reconciliation.ReconciliationModels.DiscrepancyRecord;
+import com.paycore.reconciliation.ReconciliationModels.ReconRunReport;
 import java.time.LocalDate;
 import java.util.EnumMap;
 import java.util.Map;

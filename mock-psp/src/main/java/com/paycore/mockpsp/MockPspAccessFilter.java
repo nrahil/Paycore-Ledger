@@ -5,8 +5,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import com.paycore.common.security.ServiceTokenValidator;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -48,8 +47,7 @@ public class MockPspAccessFilter extends OncePerRequestFilter {
     }
 
     private static boolean matches(String expected, String actual) {
-        return !expected.isEmpty() && actual != null && MessageDigest.isEqual(
-                expected.getBytes(StandardCharsets.UTF_8), actual.trim().getBytes(StandardCharsets.UTF_8));
+        return ServiceTokenValidator.matches(expected, actual);
     }
 
     private static String safe(String value) { return value == null ? "" : value.trim(); }

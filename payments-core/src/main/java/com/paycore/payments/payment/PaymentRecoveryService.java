@@ -11,34 +11,39 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /** Resolves PSP operations whose outcome was unknown when the original request ended. */
-final class PaymentRecoveryService {
+@Service
+public class PaymentRecoveryService {
 
     private static final Logger log = LoggerFactory.getLogger(PaymentRecoveryService.class);
 
-    private final PaymentService paymentService;
     private final JdbcClient jdbcClient;
     private final PspClient pspClient;
     private final OutboxWriter outboxWriter;
     private final ClockProvider clockProvider;
+    private final PaymentRepository paymentRepository;
+    private final PaymentCaptureRefundService captureRefundService;
     private final TransactionTemplate requiresNewTx;
 
-    PaymentRecoveryService(
-            PaymentService paymentService,
+    public PaymentRecoveryService(
             JdbcClient jdbcClient,
             PspClient pspClient,
             OutboxWriter outboxWriter,
             ClockProvider clockProvider,
+            PaymentRepository paymentRepository,
+            PaymentCaptureRefundService captureRefundService,
             PlatformTransactionManager txManager) {
-        this.paymentService = paymentService;
         this.jdbcClient = jdbcClient;
         this.pspClient = pspClient;
         this.outboxWriter = outboxWriter;
         this.clockProvider = clockProvider;
+        this.paymentRepository = paymentRepository;
+        this.captureRefundService = captureRefundService;
         this.requiresNewTx = new TransactionTemplate(txManager);
         this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -78,7 +83,7 @@ final class PaymentRecoveryService {
                             """)
                             .param("updatedAt", nowTs).param("id", stuck.id()).update();
                     if (updated == 1) {
-                        Payment after = paymentService.getPayment(stuck.merchantId(), stuck.id());
+                        Payment after = paymentRepository.findByMerchantAndId(stuck.merchantId(), stuck.id());
                         outboxWriter.writePaymentAuthorized(after.id(), after.merchantId(), after.eventSeq(),
                                 after.amount(), after.currency(), after.pspRef());
                         return true;
@@ -92,7 +97,7 @@ final class PaymentRecoveryService {
                             """)
                             .param("updatedAt", nowTs).param("id", stuck.id()).update();
                     if (updated == 1) {
-                        Payment after = paymentService.getPayment(stuck.merchantId(), stuck.id());
+                        Payment after = paymentRepository.findByMerchantAndId(stuck.merchantId(), stuck.id());
                         outboxWriter.writePaymentFailed(after.id(), after.merchantId(), after.eventSeq(),
                                 after.amount(), after.currency(), after.pspRef(), "RESOLVED_" + lookup.state().name());
                         return true;
@@ -127,13 +132,13 @@ final class PaymentRecoveryService {
         int resolved = 0;
         for (PendingOperation operation : pending) {
             try {
-                Payment payment = paymentService.getPayment(operation.merchantId(), operation.paymentId());
+                Payment payment = paymentRepository.findByMerchantAndId(operation.merchantId(), operation.paymentId());
                 if ("CAPTURE".equals(operation.type())) {
                     PspClient.PspCaptureResult result = pspClient.capture(new PspClient.PspCaptureRequest(
                             operation.paymentId(), operation.merchantId(), operation.id(), payment.pspRef(),
                             operation.amount(), payment.currency()));
                     if (result.outcome() == PspClient.PspOutcome.AUTHORIZED) {
-                        requiresNewTx.execute(status -> paymentService.finalizeCapture(
+                        requiresNewTx.execute(status -> captureRefundService.finalizeCapture(
                                 operation.merchantId(), operation.paymentId(), operation.id(), result));
                         resolved++;
                     }
@@ -142,7 +147,7 @@ final class PaymentRecoveryService {
                             operation.paymentId(), operation.merchantId(), operation.id(), payment.pspRef(),
                             operation.amount(), payment.currency()));
                     if (result.outcome() == PspClient.PspOutcome.AUTHORIZED) {
-                        requiresNewTx.execute(status -> paymentService.finalizeRefund(
+                        requiresNewTx.execute(status -> captureRefundService.finalizeRefund(
                                 operation.merchantId(), operation.paymentId(), operation.id(),
                                 new PaymentService.RefundRequest(operation.amount(), null), result));
                         resolved++;

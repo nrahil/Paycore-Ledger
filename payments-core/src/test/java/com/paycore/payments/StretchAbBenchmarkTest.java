@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Tag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -53,6 +54,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 @AutoConfigureObservability
 @Testcontainers
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+@Tag("stretch")
 class StretchAbBenchmarkTest {
 
     private static final Logger log = LoggerFactory.getLogger(StretchAbBenchmarkTest.class);
@@ -68,6 +70,8 @@ class StretchAbBenchmarkTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.datasource.hikari.maximum-pool-size", () -> "80");
+        registry.add("spring.datasource.hikari.connection-timeout", () -> "10000");
         registry.add("paycore.redis.enabled", () -> "false");
         registry.add("paycore.outbox.relay-enabled", () -> "false");
         registry.add("paycore.resolver.interval-ms", () -> "3600000");

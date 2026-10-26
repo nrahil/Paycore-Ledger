@@ -1,7 +1,7 @@
 package com.paycore.reconciliation;
 
-import com.paycore.reconciliation.ReconciliationService.DiscrepancyRecord;
-import com.paycore.reconciliation.ReconciliationService.ReconRunReport;
+import com.paycore.reconciliation.ReconciliationModels.DiscrepancyRecord;
+import com.paycore.reconciliation.ReconciliationModels.ReconRunReport;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
