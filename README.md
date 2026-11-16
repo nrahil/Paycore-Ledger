@@ -1,6 +1,6 @@
 # PayCore Ledger — Payment Orchestration & Double-Entry Ledger
 
-[![CI Pipeline](https://github.com/Juixe7/Paycore-Ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/Juixe7/Paycore-Ledger/actions/workflows/ci.yml)
+[![CI Pipeline](https://github.com/nrahil/Paycore-Ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/nrahil/Paycore-Ledger/actions/workflows/ci.yml)
 [![Java 21](https://img.shields.io/badge/Java-21%20LTS-orange.svg)](https://openjdk.org/projects/jdk/21/)
 [![Go 1.22](https://img.shields.io/badge/Go-1.22-00ADD8.svg)](https://go.dev/)
 [![Spring Boot 3.3](https://img.shields.io/badge/Spring%20Boot-3.3.5-brightgreen.svg)](https://spring.io/projects/spring-boot)
