@@ -26,6 +26,10 @@ Thumbs.db
 # Testcontainers
 .testcontainers.properties
 
+# Jqwik
+.jqwik-database/
+**/.jqwik-database
+
 # Local agent/browser artifacts and generated run output
 .opencode/
 .playwright-cli/

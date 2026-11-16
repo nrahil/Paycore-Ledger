@@ -134,8 +134,10 @@ Paycore/
 │   ├── k8s/                        # Example Kubernetes manifests and connector config
 │   └── observability/              # Prometheus rules/scrape config and Grafana provisioning
 ├── docs/
+│   ├── ARCHITECTURE_BASELINE.md    # Architecture invariants and target baseline
 │   ├── CODEBASE_MAP.md             # Module responsibilities and key flows
 │   ├── CODEBASE_CLEANUP_PLAN.md    # Cleanup phases and verification notes
+│   ├── PayCore-Payment-Service-and-Ledger-Design.pdf # Complete system design (HLD + LLD)
 │   └── observability-assets/       # Screenshots and recorded k6 results
 ├── e2e-tests/                      # Cross-service Testcontainers and Toxiproxy tests
 ├── EVIDENCE.md                     # Test, recovery, and load-test evidence
