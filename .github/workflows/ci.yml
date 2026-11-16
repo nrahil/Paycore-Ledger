@@ -12,7 +12,7 @@ permissions:
 jobs:
   proto-and-architecture-gate:
     name: Protobuf Compatibility & ArchUnit Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,11 +35,12 @@ jobs:
 
   jvm-integration-and-torture-tests:
     name: JVM Integration, Concurrency Torture & Property Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: proto-and-architecture-gate
     env:
       DOCKER_HOST: unix:///var/run/docker.sock
       TESTCONTAINERS_RYUK_DISABLED: "false"
+      DOCKER_API_VERSION: "1.44"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -58,6 +59,7 @@ jobs:
         run: |
           sudo systemctl start docker || true
           sudo chmod 666 /var/run/docker.sock || true
+          echo "api.version=1.44" >> ~/.docker-java.properties
           docker version
           docker info
 
@@ -79,7 +81,7 @@ jobs:
 
   go-edge-gateway:
     name: Go Edge Gateway Security & Rate-Limiter Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
